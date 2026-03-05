@@ -235,7 +235,7 @@ class G1Deploy {
     // Flag to disable CRC checking for MuJoCo simulation
     bool disable_crc_check_ = false;
     
-    bool reinitialize_heading_ = false;
+    bool reinitialize_heading_ = true;
     std::array<double, 4> init_ref_data_root_rot_array_;
 
     DataBuffer<LowState_> low_state_buffer_;
