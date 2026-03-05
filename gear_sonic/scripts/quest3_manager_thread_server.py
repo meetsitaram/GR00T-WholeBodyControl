@@ -85,8 +85,13 @@ class Quest3PlannerStreamer:
         self.mode = LocomotionMode.IDLE
         self.prev_ab = False
         self.prev_xy = False
+        self.prev_a = False
+        self.prev_b = False
+        self.prev_x = False
+        self.prev_y = False
         self.yaw_accumulator = YawAccumulator()
         self.last_send = time.time()
+        self._last_axes_log = 0.0
 
         self.left_hand_ik_solver, self.right_hand_ik_solver = init_hand_ik_solvers()
 
@@ -109,6 +114,18 @@ class Quest3PlannerStreamer:
         try:
             # --- button state (edge-triggered mode switching) -----------------
             a, b, x, y = self.reader.get_buttons()
+
+            # Log individual button presses (edge-triggered)
+            if a and not self.prev_a:
+                print("[Input] A pressed")
+            if b and not self.prev_b:
+                print("[Input] B pressed")
+            if x and not self.prev_x:
+                print("[Input] X pressed")
+            if y and not self.prev_y:
+                print("[Input] Y pressed")
+            self.prev_a, self.prev_b, self.prev_x, self.prev_y = a, b, x, y
+
             ab_now = a and b
             xy_now = x and y
             if ab_now and not self.prev_ab:
@@ -122,6 +139,21 @@ class Quest3PlannerStreamer:
 
             # --- joystick movement / facing -----------------------------------
             lx, ly, rx, ry = self.reader.get_controller_axes()
+
+            # Log joystick + triggers periodically (every 0.5s, only when active)
+            now = time.time()
+            if now - self._last_axes_log > 0.5:
+                lt, rt, lg, rg = self.reader.get_controller_inputs()
+                has_stick = abs(lx) > JOYSTICK_DEADZONE or abs(ly) > JOYSTICK_DEADZONE or abs(rx) > JOYSTICK_DEADZONE or abs(ry) > JOYSTICK_DEADZONE
+                has_trigger = lt > 0.1 or rt > 0.1 or lg > 0.1 or rg > 0.1
+                if has_stick or has_trigger:
+                    parts = []
+                    if has_stick:
+                        parts.append(f"sticks L({lx:+.2f},{ly:+.2f}) R({rx:+.2f},{ry:+.2f})")
+                    if has_trigger:
+                        parts.append(f"LT={lt:.2f} RT={rt:.2f} LG={lg:.2f} RG={rg:.2f}")
+                    print(f"[Input] {' | '.join(parts)}")
+                    self._last_axes_log = now
             facing = self.yaw_accumulator.update(rx, self.dt)
 
             raw_mag = np.hypot(lx, ly)
@@ -251,7 +283,9 @@ def run_quest3_manager(
     print("[Manager] Waiting for Quest 3 client to connect ...")
     print(f"[Manager] Open the WebXR page in the Quest 3 browser.")
     proto = "https" if use_ssl else "http"
-    print(f"[Manager]   URL: {proto}://<workstation-ip>:{http_port}")
+    from gear_sonic.utils.teleop.vr.quest3_reader import _get_lan_ip
+    lan_ip = _get_lan_ip()
+    print(f"[Manager]   URL: {proto}://{lan_ip}:{http_port}")
     while not reader.is_connected:
         time.sleep(0.5)
     print("[Manager] Quest 3 connected!")
@@ -294,6 +328,10 @@ def run_quest3_manager(
     current_mode = StreamMode.OFF
     prev_start_combo = False
     prev_ax = False
+    mgr_prev_a = False
+    mgr_prev_b = False
+    mgr_prev_x = False
+    mgr_prev_y = False
 
     print("[Manager] Controls: A+B+X+Y = start/stop, A+X = toggle VR 3PT")
 
@@ -304,6 +342,18 @@ def run_quest3_manager(
                 continue
 
             a, b, x, y = reader.get_buttons()
+
+            # Log individual button presses in all modes (edge-triggered)
+            if a and not mgr_prev_a:
+                print("[Input] A pressed")
+            if b and not mgr_prev_b:
+                print("[Input] B pressed")
+            if x and not mgr_prev_x:
+                print("[Input] X pressed")
+            if y and not mgr_prev_y:
+                print("[Input] Y pressed")
+            mgr_prev_a, mgr_prev_b, mgr_prev_x, mgr_prev_y = a, b, x, y
+
             start_combo = a and b and x and y
             ax_pressed = a and x
 

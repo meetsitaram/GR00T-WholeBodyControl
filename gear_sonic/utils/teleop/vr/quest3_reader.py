@@ -23,6 +23,7 @@ import asyncio
 import http.server
 import json
 import os
+import socket as _socket
 import ssl
 import subprocess
 import threading
@@ -43,6 +44,18 @@ WEBXR_TO_ROBOT = np.array(
 )
 
 _Q_ROT = sRot.from_matrix(WEBXR_TO_ROBOT)
+
+
+def _get_lan_ip() -> str:
+    """Return the LAN IP address of this machine (best-effort)."""
+    try:
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
 
 
 def _generate_self_signed_cert(cert_dir: str) -> tuple[str, str]:
@@ -289,6 +302,83 @@ class Quest3Reader:
         except json.JSONDecodeError:
             return
 
+        # Handle status messages from the WebXR client
+        if data.get("_type") == "status":
+            event = data.get("event", "unknown")
+            if event == "xr_session_started":
+                ref = data.get("ref_space", "?")
+                supported = ", ".join(data.get("supported", []))
+                unsupported = ", ".join(data.get("unsupported", []))
+                n_inputs = data.get("input_sources", 0)
+                print(f"[Quest3Reader] XR session started!")
+                print(f"[Quest3Reader]   Reference space: {ref}")
+                print(f"[Quest3Reader]   Supported spaces: {supported}")
+                if unsupported:
+                    print(f"[Quest3Reader]   Unsupported spaces: {unsupported}")
+                print(f"[Quest3Reader]   Input sources (controllers): {n_inputs}")
+                if ref != "local-floor":
+                    print(f"[Quest3Reader]   WARNING: 'local-floor' not available. Floor height may be wrong.")
+                    print(f"[Quest3Reader]   TIP: Set up Guardian on Quest 3: Settings > Physical Space > Space Setup")
+            elif event == "xr_ref_space_failed":
+                unsupported = ", ".join(data.get("unsupported", []))
+                print(f"[Quest3Reader] ERROR: No XR reference space available!")
+                print(f"[Quest3Reader]   Unsupported: {unsupported}")
+                print(f"[Quest3Reader]   FIX: Set up Guardian on Quest 3:")
+                print(f"[Quest3Reader]     1. Press Meta button > Settings > Physical Space > Space Setup")
+                print(f"[Quest3Reader]     2. Choose 'Roomscale' or 'Stationary'")
+                print(f"[Quest3Reader]     3. Follow prompts to draw boundary, then reload the page")
+            elif event == "input_sources_changed":
+                count = data.get("count", 0)
+                sources = data.get("sources", [])
+                print(f"[Quest3Reader] Input sources changed: {count} detected")
+                has_controller = False
+                has_hand = False
+                for s in sources:
+                    stype = s.get("type", "unknown")
+                    hand = s.get("handedness", "?")
+                    has_gpad = s.get("has_gamepad", False)
+                    print(f"[Quest3Reader]   {hand}: {stype} (gamepad={'yes' if has_gpad else 'NO'})")
+                    if stype == "controller":
+                        has_controller = True
+                    elif stype == "hand-tracking":
+                        has_hand = True
+                if has_hand and not has_controller:
+                    print(f"[Quest3Reader]   WARNING: Hand tracking detected but NO controllers!")
+                    print(f"[Quest3Reader]   FIX: Pick up the physical Quest 3 controllers.")
+                    print(f"[Quest3Reader]   The headset will auto-switch to controller mode.")
+                elif has_controller:
+                    print(f"[Quest3Reader]   Controllers detected — buttons and joysticks active.")
+            else:
+                print(f"[Quest3Reader] Status: {data}")
+            return
+
+        self._msg_count = getattr(self, "_msg_count", 0) + 1
+        self._last_log_count = getattr(self, "_last_log_count", 0)
+
+        # Log first message and then every 100th message
+        if self._msg_count == 1:
+            print(f"[Quest3Reader] First tracking data received! Keys: {list(data.keys())}")
+            btns = data.get("buttons", {})
+            axes = data.get("axes", {})
+            print(f"[Quest3Reader]   buttons: {btns}")
+            print(f"[Quest3Reader]   axes: {axes}")
+        elif self._msg_count % 100 == 0:
+            btns = data.get("buttons", {})
+            axes = data.get("axes", {})
+            has_input = any(v for k, v in btns.items() if k in ("a", "b", "x", "y") and v)
+            has_trigger = any(v > 0.1 for k, v in btns.items() if k not in ("a", "b", "x", "y"))
+            has_stick = any(abs(v) > 0.05 for v in axes.values())
+            status_parts = []
+            if has_input:
+                pressed = [k.upper() for k in ("a", "b", "x", "y") if btns.get(k)]
+                status_parts.append(f"btns=[{'+'.join(pressed)}]")
+            if has_trigger:
+                status_parts.append("triggers=active")
+            if has_stick:
+                status_parts.append(f"sticks=active")
+            status = " | ".join(status_parts) if status_parts else "idle"
+            print(f"[Quest3Reader] msgs={self._msg_count} fps={self._fps_ema:.1f} {status}")
+
         vr_3pt_pose = compute_3pt_pose_from_quest3(data)
 
         now = time.time()
@@ -335,7 +425,8 @@ class Quest3Reader:
                 self.ws_port,
                 ssl=ssl_ctx,
             )
-            print(f"[Quest3Reader] WebSocket server on {proto}://{self.ws_host}:{self.ws_port}")
+            lan_ip = _get_lan_ip()
+            print(f"[Quest3Reader] WebSocket server on {proto}://{lan_ip}:{self.ws_port}")
             try:
                 await asyncio.get_event_loop().create_future()
             finally:
@@ -359,6 +450,13 @@ class Quest3Reader:
             def __init__(self, *args, **kwargs):
                 super().__init__(*args, directory=app_dir, **kwargs)
 
+            def end_headers(self):
+                # Prevent browser caching so code changes take effect immediately
+                self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
+                super().end_headers()
+
             def log_message(self, format, *args):
                 pass
 
@@ -375,7 +473,8 @@ class Quest3Reader:
             except Exception as e:
                 print(f"[Quest3Reader] HTTPS setup failed ({e}), using HTTP")
 
-        print(f"[Quest3Reader] Serving WebXR app at {proto}://{self.ws_host}:{self.http_port}")
+        lan_ip = _get_lan_ip()
+        print(f"[Quest3Reader] Serving WebXR app at {proto}://{lan_ip}:{self.http_port}")
 
         while not self._stop.is_set():
             server.timeout = 0.5

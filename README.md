@@ -35,6 +35,7 @@ This is the codebase for the **GR00T Whole-Body Control (WBC)** projects. It hos
 - [TODOs](#todos)
 - [What's Included](#whats-included)
   - [Setup](#setup)
+  - [Local Development (Native)](#local-development-native)
 - [Documentation](#documentation)
 - [Citation](#citation)
 - [License](#license)
@@ -175,6 +176,58 @@ Clone the repository with Git LFS:
 git clone https://github.com/NVlabs/GR00T-WholeBodyControl.git
 cd GR00T-WholeBodyControl
 git lfs pull
+```
+
+### Local Development (Native)
+
+> See [DEV_NOTES.md](DEV_NOTES.md) for detailed environment notes and troubleshooting.
+
+**1. Install system dependencies & build the C++ stack:**
+```bash
+cd gear_sonic_deploy
+chmod +x scripts/install_deps.sh
+./scripts/install_deps.sh
+source scripts/setup_env.sh
+just build
+```
+
+**2. Create a Python virtual environment (uv + Python 3.10):**
+```bash
+cd GR00T-WholeBodyControl   # repo root
+uv venv --python 3.10 .venv
+source .venv/bin/activate
+```
+
+**3. Install Python packages:**
+```bash
+# GEAR-SONIC (teleop + simulation extras)
+uv pip install -e "gear_sonic/[teleop,sim]"
+
+# Decoupled WBC (full + dev extras)
+uv pip install setuptools wheel poetry-core poetry
+uv pip install --no-build-isolation -e "decoupled_wbc/[full,dev]"
+```
+
+**4. Activate the environment (every new shell):**
+```bash
+# From the repo root:
+source .venv/bin/activate                              # Python venv
+cd gear_sonic_deploy && source scripts/setup_env.sh    # C++ env (CUDA, TensorRT, ONNX Runtime)
+```
+
+**5. Run:**
+```bash
+# C++ deployment binary
+./gear_sonic_deploy/target/release/g1_deploy_onnx_ref
+
+# Inference frequency test
+./gear_sonic_deploy/target/release/freq_test policy/release/model_decoder.onnx
+
+# Unit tests
+./gear_sonic_deploy/target/release/run_tests
+
+# Rebuild after code changes
+cd gear_sonic_deploy && just build
 ```
 
 ## Documentation

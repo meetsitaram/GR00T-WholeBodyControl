@@ -17,7 +17,7 @@
     display: grid; grid-template-columns: auto 1fr;
     gap: 4px 12px; font-size: 0.85rem; margin-bottom: 16px;
     background: #1a1a1a; padding: 12px 16px; border-radius: 8px;
-    min-width: 280px;
+    min-width: 320px;
   }
   .status-grid .label { color: #888; }
   .status-grid .value { font-family: monospace; }
@@ -40,6 +40,28 @@
     font-size: 0.9rem; width: 200px;
   }
   small { color: #666; font-size: 0.75rem; margin-top: 8px; display: block; }
+
+  /* Debug log panel */
+  #debugPanel {
+    margin-top: 16px; width: 100%; max-width: 400px;
+    background: #0a0a0a; border: 1px solid #333; border-radius: 8px;
+    padding: 10px; font-size: 0.75rem; font-family: monospace;
+  }
+  #debugPanel .debug-title {
+    color: #76b900; font-weight: 600; margin-bottom: 6px; font-size: 0.8rem;
+  }
+  #inputState {
+    color: #aaa; line-height: 1.6; white-space: pre; margin-bottom: 8px;
+  }
+  #logArea {
+    max-height: 200px; overflow-y: auto; color: #ccc;
+    border-top: 1px solid #222; padding-top: 6px;
+  }
+  #logArea div { padding: 1px 0; }
+  #logArea .log-btn { color: #4caf50; }
+  #logArea .log-ws  { color: #2196f3; }
+  #logArea .log-xr  { color: #ff9800; }
+  #logArea .log-err { color: #f44336; }
 </style>
 </head>
 <body>
@@ -55,6 +77,8 @@
   <span class="value" id="fps">—</span>
   <span class="label">Frames sent</span>
   <span class="value" id="frameCount">0</span>
+  <span class="label">Controllers</span>
+  <span class="value" id="controllerCount">0</span>
 </div>
 
 <div class="row">
@@ -68,17 +92,43 @@
 
 <small>Open this page in the Quest 3 browser. Enter the workstation IP.</small>
 
+<div id="debugPanel">
+  <div class="debug-title">Live Input State</div>
+  <div id="inputState">No XR session active</div>
+  <div class="debug-title">Log</div>
+  <div id="logArea"></div>
+</div>
+
 <script>
 /* ------------------------------------------------------------------ */
 /* State                                                               */
 /* ------------------------------------------------------------------ */
 let ws = null;
 let xrSession = null;
+let xrGL = null;
 let refSpace = null;
 let frameCount = 0;
 let lastSendTime = 0;
 const FPS_WINDOW = 20;
 let fpsRing = [];
+
+/* Previous button state for edge-triggered logging */
+let prevBtns = { a: false, b: false, x: false, y: false };
+
+/* ------------------------------------------------------------------ */
+/* Debug logger                                                        */
+/* ------------------------------------------------------------------ */
+const MAX_LOG_LINES = 50;
+function debugLog(msg, cls) {
+  const area = document.getElementById('logArea');
+  const div = document.createElement('div');
+  const ts = new Date().toLocaleTimeString('en-US', {hour12:false});
+  div.textContent = `[${ts}] ${msg}`;
+  if (cls) div.className = cls;
+  area.appendChild(div);
+  while (area.children.length > MAX_LOG_LINES) area.removeChild(area.firstChild);
+  area.scrollTop = area.scrollHeight;
+}
 
 /* ------------------------------------------------------------------ */
 /* WebSocket                                                           */
@@ -88,22 +138,26 @@ function toggleWS() {
   const url = document.getElementById('wsUrl').value.trim();
   if (!url) { alert('Enter the WebSocket URL first'); return; }
 
+  debugLog('Connecting to ' + url + ' ...', 'log-ws');
   ws = new WebSocket(url);
   ws.onopen = () => {
     document.getElementById('wsStatus').textContent = 'connected';
     document.getElementById('wsStatus').className = 'value ok';
     document.getElementById('btnWS').textContent = 'Disconnect';
-    document.getElementById('btnVR').disabled = !navigator.xr;
+    document.getElementById('btnVR').disabled = false;
+    debugLog('WebSocket connected', 'log-ws');
   };
-  ws.onclose = () => {
+  ws.onclose = (e) => {
     document.getElementById('wsStatus').textContent = 'disconnected';
     document.getElementById('wsStatus').className = 'value err';
     document.getElementById('btnWS').textContent = 'Connect WS';
     document.getElementById('btnVR').disabled = true;
+    debugLog('WebSocket closed (code=' + e.code + ')', 'log-ws');
   };
   ws.onerror = () => {
     document.getElementById('wsStatus').textContent = 'error';
     document.getElementById('wsStatus').className = 'value err';
+    debugLog('WebSocket error', 'log-err');
   };
 }
 
@@ -116,41 +170,145 @@ async function toggleVR() {
   if (!navigator.xr) {
     document.getElementById('xrStatus').textContent = 'WebXR not supported';
     document.getElementById('xrStatus').className = 'value err';
+    debugLog('navigator.xr not available', 'log-err');
     return;
   }
 
-  const supported = await navigator.xr.isSessionSupported('immersive-vr');
-  if (!supported) {
-    document.getElementById('xrStatus').textContent = 'immersive-vr not supported';
+  debugLog('Checking immersive-vr support ...', 'log-xr');
+  /* Try immersive-ar first (passthrough), fall back to immersive-vr */
+  let sessionMode = null;
+  for (const mode of ['immersive-ar', 'immersive-vr']) {
+    const ok = await navigator.xr.isSessionSupported(mode);
+    if (ok) { sessionMode = mode; break; }
+    debugLog(mode + ' not supported, trying next...', 'log-xr');
+  }
+  if (!sessionMode) {
+    document.getElementById('xrStatus').textContent = 'no XR mode supported';
     document.getElementById('xrStatus').className = 'value err';
+    debugLog('Neither immersive-ar nor immersive-vr supported', 'log-err');
     return;
   }
+  debugLog('Using ' + sessionMode + ' (passthrough=' + (sessionMode === 'immersive-ar') + ')', 'log-xr');
 
   try {
-    xrSession = await navigator.xr.requestSession('immersive-vr');
-    refSpace = await xrSession.requestReferenceSpace('local-floor');
+    xrSession = await navigator.xr.requestSession(sessionMode, {
+      optionalFeatures: ['local-floor', 'local', 'passthrough'],
+    });
+    debugLog('XR session created', 'log-xr');
+
+    /* Try reference spaces in order of preference */
+    const refTypes = ['local-floor', 'local', 'viewer'];
+    let usedRefType = null;
+    const supportedTypes = [];
+    const unsupportedTypes = [];
+    for (const rt of refTypes) {
+      try {
+        const testRef = await xrSession.requestReferenceSpace(rt);
+        supportedTypes.push(rt);
+        if (!refSpace) {
+          refSpace = testRef;
+          usedRefType = rt;
+        }
+      } catch (refErr) {
+        unsupportedTypes.push(rt);
+        debugLog('Reference space "' + rt + '" not available', 'log-xr');
+      }
+    }
+    if (!refSpace) {
+      debugLog('No reference space available! Set up Guardian on Quest 3.', 'log-err');
+      /* Send error to server */
+      if (ws && ws.readyState === 1) {
+        ws.send(JSON.stringify({
+          _type: 'status',
+          event: 'xr_ref_space_failed',
+          supported: supportedTypes,
+          unsupported: unsupportedTypes,
+          hint: 'Set up Guardian: Settings > Physical Space > Space Setup'
+        }));
+      }
+      xrSession.end();
+      return;
+    }
+    debugLog('Using reference space: ' + usedRefType + ' (supported: ' + supportedTypes.join(', ') + ')', 'log-xr');
+    /* Send status to server */
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({
+        _type: 'status',
+        event: 'xr_session_started',
+        ref_space: usedRefType,
+        supported: supportedTypes,
+        unsupported: unsupportedTypes,
+        input_sources: xrSession.inputSources.length
+      }));
+    }
 
     document.getElementById('xrStatus').textContent = 'active';
     document.getElementById('xrStatus').className = 'value ok';
     document.getElementById('btnVR').textContent = 'Stop VR';
 
     xrSession.addEventListener('end', () => {
-      xrSession = null; refSpace = null;
+      xrSession = null; refSpace = null; xrGL = null;
       document.getElementById('xrStatus').textContent = 'ended';
       document.getElementById('xrStatus').className = 'value warn';
       document.getElementById('btnVR').textContent = 'Start VR';
+      document.getElementById('inputState').textContent = 'No XR session active';
+      debugLog('XR session ended', 'log-xr');
     });
 
-    /* Dummy WebGL context — required by requestAnimationFrame. */
+    /* WebGL context with alpha for passthrough transparency */
     const canvas = document.createElement('canvas');
-    const gl = canvas.getContext('webgl2', { xrCompatible: true });
-    const layer = new XRWebGLLayer(xrSession, gl);
+    xrGL = canvas.getContext('webgl2', { xrCompatible: true, alpha: true });
+    if (!xrGL) {
+      debugLog('Failed to get webgl2 context', 'log-err');
+      xrSession.end();
+      return;
+    }
+    const layer = new XRWebGLLayer(xrSession, xrGL, { alpha: true });
     xrSession.updateRenderState({ baseLayer: layer });
+
+    /* Set clear color to transparent for passthrough */
+    xrGL.clearColor(0, 0, 0, 0);
+    debugLog('WebGL layer attached, starting frame loop', 'log-xr');
+
+    /* Log input source changes (controller connect/disconnect, hand tracking switch) */
+    xrSession.addEventListener('inputsourceschange', (ev) => {
+      debugLog('Input sources changed! Now: ' + xrSession.inputSources.length, 'log-xr');
+      for (const src of xrSession.inputSources) {
+        const type = src.hand ? 'hand-tracking' : (src.gamepad ? 'controller' : 'unknown');
+        debugLog('  ' + src.handedness + ': ' + type +
+          (src.gamepad ? ' (buttons=' + src.gamepad.buttons.length + ' axes=' + src.gamepad.axes.length + ')' : ''), 'log-xr');
+      }
+      /* Notify server */
+      if (ws && ws.readyState === 1) {
+        const sources = [];
+        for (const src of xrSession.inputSources) {
+          sources.push({
+            handedness: src.handedness,
+            type: src.hand ? 'hand-tracking' : (src.gamepad ? 'controller' : 'unknown'),
+            has_gamepad: !!src.gamepad,
+            has_grip: !!src.gripSpace,
+          });
+        }
+        ws.send(JSON.stringify({
+          _type: 'status',
+          event: 'input_sources_changed',
+          count: xrSession.inputSources.length,
+          sources: sources
+        }));
+      }
+    });
+
+    /* Log initial input sources */
+    for (const src of xrSession.inputSources) {
+      const type = src.hand ? 'hand-tracking' : (src.gamepad ? 'controller' : 'unknown');
+      debugLog('Initial input: ' + src.handedness + ' = ' + type, 'log-xr');
+    }
 
     xrSession.requestAnimationFrame(onXRFrame);
   } catch (e) {
     document.getElementById('xrStatus').textContent = 'request failed';
     document.getElementById('xrStatus').className = 'value err';
+    debugLog('XR request failed: ' + e.message, 'log-err');
     console.error(e);
   }
 }
@@ -158,14 +316,40 @@ async function toggleVR() {
 /* ------------------------------------------------------------------ */
 /* Per-frame tracking                                                  */
 /* ------------------------------------------------------------------ */
+let xrFrameErrors = 0;
+let xrFirstFrame = true;
+
 function onXRFrame(time, frame) {
   if (!xrSession) return;
   xrSession.requestAnimationFrame(onXRFrame);
 
-  if (!ws || ws.readyState !== 1) return;
+  try {
+
+  if (xrFirstFrame) {
+    debugLog('First XR frame! inputSources: ' + xrSession.inputSources.length, 'log-xr');
+    for (const src of xrSession.inputSources) {
+      debugLog('  source: hand=' + src.handedness + ' grip=' + !!src.gripSpace + ' gamepad=' + !!src.gamepad, 'log-xr');
+    }
+    xrFirstFrame = false;
+  }
+
+  if (!ws || ws.readyState !== 1) {
+    if (frameCount === 0) debugLog('WS not ready (state=' + (ws ? ws.readyState : 'null') + ')', 'log-err');
+    return;
+  }
+
+  /* Clear framebuffer to transparent for passthrough */
+  const glLayer = xrSession.renderState.baseLayer;
+  if (glLayer && xrGL) {
+    xrGL.bindFramebuffer(xrGL.FRAMEBUFFER, glLayer.framebuffer);
+    xrGL.clear(xrGL.COLOR_BUFFER_BIT | xrGL.DEPTH_BUFFER_BIT);
+  }
 
   const pose = frame.getViewerPose(refSpace);
-  if (!pose) return;
+  if (!pose) {
+    if (frameCount === 0) debugLog('No viewer pose available', 'log-err');
+    return;
+  }
 
   /* Head (viewer) pose */
   const hp = pose.transform.position;
@@ -182,10 +366,12 @@ function onXRFrame(time, frame) {
   };
   const axes = { lx: 0, ly: 0, rx: 0, ry: 0 };
 
+  let numControllers = 0;
   for (const src of xrSession.inputSources) {
     if (!src.gripSpace) continue;
     const gp = frame.getPose(src.gripSpace, refSpace);
     if (!gp) continue;
+    numControllers++;
 
     const pp = gp.transform.position;
     const po = gp.transform.orientation;
@@ -219,6 +405,28 @@ function onXRFrame(time, frame) {
     }
   }
 
+  /* Edge-triggered button logging */
+  if (buttons.a && !prevBtns.a) debugLog('A pressed', 'log-btn');
+  if (buttons.b && !prevBtns.b) debugLog('B pressed', 'log-btn');
+  if (buttons.x && !prevBtns.x) debugLog('X pressed', 'log-btn');
+  if (buttons.y && !prevBtns.y) debugLog('Y pressed', 'log-btn');
+  if (!buttons.a && prevBtns.a) debugLog('A released', 'log-btn');
+  if (!buttons.b && prevBtns.b) debugLog('B released', 'log-btn');
+  if (!buttons.x && prevBtns.x) debugLog('X released', 'log-btn');
+  if (!buttons.y && prevBtns.y) debugLog('Y released', 'log-btn');
+  prevBtns = { a: buttons.a, b: buttons.b, x: buttons.x, y: buttons.y };
+
+  /* Update live input state display */
+  document.getElementById('controllerCount').textContent = numControllers;
+  const stateLines = [
+    `Buttons: A=${buttons.a?'ON':'--'}  B=${buttons.b?'ON':'--'}  X=${buttons.x?'ON':'--'}  Y=${buttons.y?'ON':'--'}`,
+    `Sticks:  L(${axes.lx.toFixed(2)}, ${axes.ly.toFixed(2)})  R(${axes.rx.toFixed(2)}, ${axes.ry.toFixed(2)})`,
+    `Trigger: L=${buttons.leftTrigger.toFixed(2)}  R=${buttons.rightTrigger.toFixed(2)}`,
+    `Grip:    L=${buttons.leftGrip.toFixed(2)}  R=${buttons.rightGrip.toFixed(2)}`,
+    `Head:    (${hp.x.toFixed(2)}, ${hp.y.toFixed(2)}, ${hp.z.toFixed(2)})`,
+  ];
+  document.getElementById('inputState').textContent = stateLines.join('\n');
+
   const msg = {
     head:  { position: [hp.x, hp.y, hp.z], orientation: [ho.x, ho.y, ho.z, ho.w] },
     left:  leftData,
@@ -240,6 +448,14 @@ function onXRFrame(time, frame) {
     const dt = (fpsRing[fpsRing.length-1] - fpsRing[0]) / (fpsRing.length - 1);
     document.getElementById('fps').textContent = (1000 / dt).toFixed(1);
   }
+
+  } catch (err) {
+    xrFrameErrors++;
+    if (xrFrameErrors <= 3) {
+      debugLog('XR frame error: ' + err.message, 'log-err');
+      console.error('onXRFrame error:', err);
+    }
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -253,10 +469,13 @@ function onXRFrame(time, frame) {
   if (navigator.xr) {
     document.getElementById('xrStatus').textContent = 'available';
     document.getElementById('xrStatus').className = 'value ok';
+    debugLog('WebXR available', 'log-xr');
   } else {
     document.getElementById('xrStatus').textContent = 'not available';
     document.getElementById('xrStatus').className = 'value err';
+    debugLog('WebXR NOT available on this browser', 'log-err');
   }
+  debugLog('Auto-filled WS URL: ' + proto + '://' + host + ':8765', 'log-ws');
 })();
 </script>
 </body>

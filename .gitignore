@@ -192,3 +192,5 @@ uv.lock
 xrobotoolkit_sdk.cpython-*-*-*.so
 teleop_vids/
 *.code-workspace
+# Quest 3 TLS certificates (generated locally)
+gear_sonic/utils/teleop/vr/quest3_certs/
