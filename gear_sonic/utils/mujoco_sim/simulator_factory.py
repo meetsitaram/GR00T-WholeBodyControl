@@ -39,7 +39,8 @@ class SimulatorFactory:
             return SimulatorFactory._create_mujoco_simulator(config, env_name, **kwargs)
         else:
             print(
-                f"Warning: Invalid simulator type: {simulator_type}. "
+                f"Warning: Unknown simulator type: {simulator_type}. "
+                "For Isaac Lab, use run_sim_isaaclab.sh instead of run_sim_loop.py. "
                 "If you are using run_sim_loop, please ignore this warning."
             )
             return None
