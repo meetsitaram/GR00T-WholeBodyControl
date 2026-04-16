@@ -1,16 +1,16 @@
 # @package _global_
-# SONIC X2 Ultra config — 3 encoders (G1/motion tracking, teleop, SMPL) for Agibot X2 Ultra.
-# Based on sonic_h2 but targeting the X2 Ultra robot (32 bodies, 31 DOF).
+# SONIC X2 Ultra smoke test — 2 encoders (motion tracking + teleop), no SMPL.
+# Minimal config for verifying the full pipeline end-to-end.
 
 defaults:
   - /algo: ppo_im_phc
   - /manager_env: base_env
   - /callbacks/read_eval
   - /callbacks/im_resample
-  - /aux_losses: universal_token/g1_recon_and_all_latent
+  - /aux_losses: universal_token/x2_recon_and_teleop_latent
   - override /trainer: trl_ppo_aux
-  - override /actor_critic: universal_token/all_mlp_v1
-  - override /manager_env/observations/tokenizer: unitoken_all_noz
+  - override /actor_critic: universal_token/x2_teleop_mlp_v1
+  - override /manager_env/observations/tokenizer: unitoken_x2_teleop_noz
   - override /manager_env/observations/policy: local_dir_hist
   - override /manager_env/observations/critic: privileged_mf_hist
   - override /manager_env/events: tracking/level0_4
@@ -20,12 +20,12 @@ defaults:
 use_manager_env: true
 
 exp_base: ${hydra:runtime.choices.exp}
-exp_var: test
+exp_var: smoke
 experiment_name: ${exp_base}_${exp_var}
 experiment_dir: ${base_dir}/${project_name}/${experiment_name}-${timestamp}
 
-num_envs: 4096
-project_name: TRL_X2Ultra_Track
+num_envs: 2
+project_name: TRL_X2Ultra_Smoke
 
 actor_prop_history_length: 10
 actor_actions_history_length: 10
@@ -50,25 +50,23 @@ manager_env:
       reward_point_body_offset: [[0.0, 0.0, 0.5], [0.0, -0.0, 0.0], [0.0, -0.0, 0.0]]
       num_future_frames: 10
       dt_future_ref_frames: 0.1
-      smpl_num_future_frames: 10
-      smpl_dt_future_ref_frames: 0.02
       cat_upper_body_poses: true
       cat_upper_body_poses_prob: 0.5
 
       freeze_frame_aug: true
-      teleop_sample_prob_when_smpl: 0.5
 
       motion_lib_cfg:
         adaptive_sampling:
           adp_samp_failure_rate_max_over_mean: 200
         motion_file: gear_sonic/data/motions/x2_ultra_soma_10.pkl
-        smpl_motion_file: dummy
+        smpl_motion_file: null
         smpl_y_up: true
         asset:
           assetFileName: "x2_ultra.xml"
 
 algo:
   config:
+    num_learning_iterations: 2000
     empty_cache_every_n_ppo_epoch: -1
     num_steps_per_env: 24
     use_clampped_std: true
@@ -77,7 +75,7 @@ algo:
     max_grad_norm: 0.1
     actor:
       backbone:
-        reencode_smpl_g1_recon: true
+        reencode_smpl_g1_recon: false
         encoders:
           g1:
             inputs: ["command_multi_future_nonflat", "motion_anchor_ori_b_mf_nonflat"]
@@ -88,13 +86,6 @@ algo:
                 "vr_3point_local_target",
                 "vr_3point_local_orn_target",
                 "motion_anchor_ori_b",
-              ]
-          smpl:
-            inputs:
-              [
-                "smpl_joints_multi_future_local_nonflat",
-                "smpl_root_ori_b_multi_future",
-                "joint_pos_multi_future_wrist_for_smpl",
               ]
         decoders:
           g1_kin:
