@@ -130,6 +130,69 @@ ARMATURES = {
 }
 
 
+# ---- Deployment-side per-joint-group PD scaling.
+#
+# Background (G5 + G16/G16b in docs/source/user_guide/sim2sim_mujoco.md):
+# IsaacLab integrates PD against the joint-space inertia + armature implicitly,
+# so the same numerical KP behaves stiffer than the explicit `ctrl`-driven
+# torque MuJoCo applies during deployment. The standard fix used by every
+# legged-RL deployment pipeline (incl. SONIC's own G1 deployment in
+# `gear_sonic/utils/mujoco_sim/wbc_configs/g1_29dof_sonic_model12.yaml`,
+# which ships separate `JOINT_KP` and `MOTOR_KP` arrays) is to keep the
+# trained policy as-is and bump the DEPLOYED PD per joint group to recover
+# the lost loop gain.
+#
+# These multipliers are applied to KP and KD only — `action_scale` continues
+# to be derived from the unscaled (training-equivalent) KP so the policy's
+# action-to-target-offset mapping matches what was learned. Net effect: the
+# same policy output produces a stiffer correction torque on the bumped
+# joints.
+#
+# Values picked from G16b fine-grain sweep on
+# `run-20260420_083925/model_step_006000.pt`, n=50 standing motions:
+#   ankle KP ×1.5         → +0.51 s mean survival, 38W/10L (best surgical)
+#   global KP ×1.3        → +0.47 s (broadband, equivalent)
+#   ankle KP ×2.0 (4k)    → +0.85 s on the less-trained 4k checkpoint
+# Conservative default below is 1.5× ankle KP, KD untouched, on the
+# observation that:
+#   - well-trained policies need smaller bumps (4k wanted ×2, 6k wants ×1.5)
+#   - the response above 2.0 is non-monotone (signs of ringing)
+#   - per-group asymmetry beyond ankle (waist down, knee KD down, etc.) DID
+#     NOT help X2 — only the ankle bump transferred.
+# Override per-run from CLI with --kp-scale-* / --kd-scale-* flags in
+# `benchmark_motions_mujoco.py` (the benchmark scales multiply on top).
+DEPLOYMENT_KP_SCALE = {
+    "hip": 1.0, "knee": 1.0,
+    "ankle": 1.5,
+    "waist": 1.0,
+    "shoulder": 1.0, "elbow": 1.0,
+    "wrist": 1.0,
+    "head": 1.0,
+}
+DEPLOYMENT_KD_SCALE = {
+    "hip": 1.0, "knee": 1.0,
+    "ankle": 1.0,
+    "waist": 1.0,
+    "shoulder": 1.0, "elbow": 1.0,
+    "wrist": 1.0,
+    "head": 1.0,
+}
+
+
+def _deployment_pd_scale(jname: str, table: dict) -> float:
+    """Return the per-joint deployment scale for `jname` against `table`.
+
+    Match patterns are evaluated against the MuJoCo joint name with `left_`/
+    `right_` and `_joint` stripped. Most-specific patterns first ("ankle"
+    before "wrist") so foot joints don't accidentally hit a generic key.
+    """
+    short = jname.replace("left_", "").replace("right_", "").replace("_joint", "")
+    for token in ("hip", "knee", "ankle", "waist", "shoulder", "elbow", "wrist", "head"):
+        if token in short:
+            return float(table[token])
+    return 1.0
+
+
 def _compute_gains_and_scales():
     kp = np.zeros(NUM_DOFS, dtype=np.float64)
     kd = np.zeros(NUM_DOFS, dtype=np.float64)
@@ -137,18 +200,27 @@ def _compute_gains_and_scales():
     default_pos = np.zeros(NUM_DOFS, dtype=np.float64)
 
     for i, jname in enumerate(MUJOCO_JOINT_NAMES):
-        # PD gains from armature
+        # Training-equivalent PD from armature (the IsaacLab implicit values).
+        kp_train = 0.0
+        kd_train = 0.0
         for key, arm in ARMATURES.items():
             if key in jname:
-                kp[i] = arm * NATURAL_FREQ**2
-                kd[i] = 2.0 * DAMPING_RATIO * arm * NATURAL_FREQ
+                kp_train = arm * NATURAL_FREQ**2
+                kd_train = 2.0 * DAMPING_RATIO * arm * NATURAL_FREQ
                 break
 
-        # Action scale = 0.25 * effort / stiffness
+        # Deployment KP/KD = training PD × per-group scale (G16b).
+        kp[i] = kp_train * _deployment_pd_scale(jname, DEPLOYMENT_KP_SCALE)
+        kd[i] = kd_train * _deployment_pd_scale(jname, DEPLOYMENT_KD_SCALE)
+
+        # Action scale = 0.25 * effort / training KP (NOT scaled). This
+        # preserves the policy's learned [-1, 1] → joint-target-offset
+        # mapping; the deployment-side stiffening shows up purely as a
+        # higher torque per unit error, not as a rescaled command range.
         short = jname.replace("_joint", "").replace("left_", "").replace("right_", "")
         for ekey, effort in EFFORT_LIMITS.items():
             if ekey in jname.replace("_joint", ""):
-                action_scale[i] = 0.25 * effort / kp[i]
+                action_scale[i] = 0.25 * effort / kp_train
                 break
 
         # Default positions
@@ -527,7 +599,69 @@ def main():
         default=0.0,
         help="If > 0, force a reset after this many simulated seconds (default 0 = no limit).",
     )
+
+    # ---- Per-joint-group PD scaling. Multiplicative on top of the
+    # DEPLOYMENT_KP_SCALE / DEPLOYMENT_KD_SCALE tables baked into this script
+    # from G16b. Use these flags to A/B against the baked defaults at runtime
+    # (e.g. --kp-scale-ankle 0.6667 undoes the baked ankle ×1.5 to recover the
+    # pre-G16b training-equivalent PD).
+    parser.add_argument("--kp-scale", type=float, default=1.0,
+                        help="Global multiplier applied to KP on every DOF.")
+    parser.add_argument("--kd-scale", type=float, default=1.0,
+                        help="Global multiplier applied to KD on every DOF.")
+    for group, default_help in [
+        ("leg",   "hip_yaw/roll/pitch"),
+        ("knee",  "knee"),
+        ("ankle", "ankle_pitch/roll"),
+        ("waist", "waist_yaw/pitch/roll"),
+        ("arm",   "shoulder + elbow"),
+        ("wrist", "wrist_yaw/pitch/roll"),
+        ("head",  "head_yaw/pitch"),
+    ]:
+        parser.add_argument(f"--kp-scale-{group}", type=float, default=1.0,
+                            help=f"KP multiplier on {group} group "
+                                 f"({default_help}). Default 1.0.")
+        parser.add_argument(f"--kd-scale-{group}", type=float, default=1.0,
+                            help=f"KD multiplier on {group} group "
+                                 f"({default_help}). Default 1.0.")
     args = parser.parse_args()
+
+    # Build per-DOF KP/KD scale arrays from the CLI groups, apply to the
+    # module-level KP/KD imported by the rest of this script.
+    _PD_GROUPS = [
+        ("hip", "leg"), ("knee", "knee"), ("ankle", "ankle"),
+        ("waist", "waist"), ("shoulder", "arm"), ("elbow", "arm"),
+        ("wrist", "wrist"), ("head", "head"),
+    ]
+    group_kp = {"leg": args.kp_scale_leg, "knee": args.kp_scale_knee,
+                "ankle": args.kp_scale_ankle, "waist": args.kp_scale_waist,
+                "arm": args.kp_scale_arm, "wrist": args.kp_scale_wrist,
+                "head": args.kp_scale_head}
+    group_kd = {"leg": args.kd_scale_leg, "knee": args.kd_scale_knee,
+                "ankle": args.kd_scale_ankle, "waist": args.kd_scale_waist,
+                "arm": args.kd_scale_arm, "wrist": args.kd_scale_wrist,
+                "head": args.kd_scale_head}
+    kp_runtime = np.full(NUM_DOFS, float(args.kp_scale), dtype=np.float64)
+    kd_runtime = np.full(NUM_DOFS, float(args.kd_scale), dtype=np.float64)
+    for i, jname in enumerate(MUJOCO_JOINT_NAMES):
+        short = jname.replace("left_", "").replace("right_", "").replace("_joint", "")
+        for tok, grp in _PD_GROUPS:
+            if tok in short:
+                kp_runtime[i] *= group_kp[grp]
+                kd_runtime[i] *= group_kd[grp]
+                break
+    summary = []
+    if abs(args.kp_scale - 1.0) > 1e-9: summary.append(f"global kp×{args.kp_scale:g}")
+    if abs(args.kd_scale - 1.0) > 1e-9: summary.append(f"global kd×{args.kd_scale:g}")
+    for grp in group_kp:
+        if abs(group_kp[grp]-1.0)>1e-9 or abs(group_kd[grp]-1.0)>1e-9:
+            summary.append(f"{grp}(kp×{group_kp[grp]:g},kd×{group_kd[grp]:g})")
+    if summary:
+        print(f"  Runtime PD overrides (multiplicative on top of baked "
+              f"DEPLOYMENT_*_SCALE): {', '.join(summary)}", flush=True)
+    global KP, KD
+    KP = (KP * kp_runtime).astype(np.float64)
+    KD = (KD * kd_runtime).astype(np.float64)
 
     print(f"Loading actor from {args.checkpoint} ...", flush=True)
     actor = load_actor_from_checkpoint(args.checkpoint, args.device)
