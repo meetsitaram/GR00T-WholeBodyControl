@@ -35,6 +35,16 @@ Local workstation                                  Cloud node (8x GPU)
 
 ## 1. Pre-flight on your local workstation
 
+> **Commit + push your code changes BEFORE building the bundle.** The
+> cloud-side workflow is `git clone <REPO_URL> --branch <REPO_BRANCH>` →
+> `tar -xzf bundle.tar.gz` on top. Anything you've only edited locally
+> (Python, configs, shell scripts) but haven't pushed will silently be
+> the *old* version on the cloud node. The bundle is only for gitignored
+> artifacts; tracked-but-uncommitted files are a footgun. Run
+> `git status` and either `git commit && git push` or accept that the
+> cloud node will run stale code. (We learned this the slow way — see
+> commit `8fb1ca6` for the symptom.)
+
 The cloud node needs a handful of files that aren't in git: the motion
 libraries (gitignored under `data/`) and any new experiment yaml / helper
 scripts that haven't been committed yet. Bundle them all into one tarball.
@@ -115,6 +125,16 @@ recipe is stable.
 > (region, platform, preset) tuple that matches your filter. Use that
 > region/platform in the `compute instance create` call below — it's the
 > difference between "node ready in 2 min" and "scheduler timeout in 5 min".
+>
+> **Capacity advice is `* STALE` and frequently lies for 8-GPU presets.**
+> Every row in the scanner output is marked stale (Nebius's own caveat),
+> and we've seen "4/4 HIGH on-demand" 8x H200 advice produce a *husk*
+> instance: `state: STOPPED`, no public IP, `resource_version: 1`,
+> never actually scheduled (see B.4). 1-GPU presets allocate reliably.
+> **If you're cold-starting on a new region or after a long away period,
+> create a 1×H200 first** (cheap, ~30 s create) to validate the whole
+> path (image family, subnet, SSH key, bootstrap), then scale up to 8x
+> with confidence.
 
 ## 3. Install Isaac Lab and create the conda env
 
@@ -124,8 +144,16 @@ recipe is stable.
 > [`gear_sonic/scripts/cloud/bootstrap_fresh_node.sh`](../../../gear_sonic/scripts/cloud/bootstrap_fresh_node.sh)
 > instead. It bundles every fix in Appendix B (B.6 conda ToS, B.7 isaacsim
 > pin, B.8 EULA env, B.9 setuptools/flatdict, B.10b/c/d, B.11 git-lfs)
-> into 13 idempotent phases and ends at a passing Hydra dry-compose. ~15-20
-> min on a fresh `ubuntu24.04-cuda12` Nebius node:
+> into 13 idempotent phases and ends at a passing Hydra dry-compose. ~15
+> min on a fresh `ubuntu24.04-cuda13.0` Nebius node (cuda12 retired in
+> April 2026 — see B.2):
+>
+> **Required env vars** — without these the script hard-fails at Phase 11:
+>
+> | Variable | Purpose | Example |
+> |---|---|---|
+> | `REPO_URL` | git URL to clone (HTTPS works without SSH key on the cloud node) | `https://github.com/<fork>/GR00T-WholeBodyControl.git` |
+> | `REPO_BRANCH` | branch to check out (default `main`) | `wip/mujoco-experiments-20260420` |
 >
 > ```bash
 > # On your workstation, scp the script to the new node:
@@ -133,9 +161,17 @@ recipe is stable.
 >
 > # On the cloud node:
 > ssh ubuntu@$PUBLIC_IP
-> REPO_URL=git@github.com:<your-fork>/GR00T-WholeBodyControl.git \
->   bash ~/bootstrap_fresh_node.sh 2>&1 | tee ~/bootstrap.log
+> REPO_URL=https://github.com/<fork>/GR00T-WholeBodyControl.git \
+> REPO_BRANCH=<your-branch> \
+>   tmux new -d -s bootstrap "bash ~/bootstrap_fresh_node.sh 2>&1 | tee ~/bootstrap.log"
+> # Detach-safe; poll with: tail -f ~/bootstrap.log
 > ```
+>
+> Picking the branch wrong is the most common silent failure: if the
+> branch you specify doesn't have your latest commits (you forgot to
+> `git push`), training will run with stale code and you won't notice
+> until a behavior regresses. Always `git status && git log @{u}..HEAD`
+> on your workstation immediately before launching bootstrap.
 >
 > When it finishes, jump straight to §5 (`scp` bundle). The rest of §3 + §4
 > below is the manual walkthrough the script automates — read it for
@@ -463,6 +499,8 @@ already added it to the tarball in §1):
 cd ~/GR00T-WholeBodyControl
 
 # Make sure you're on the branch with the make_x2_ultra_cfg factory.
+# (If you haven't pushed your local commits, this `git pull` will silently
+# leave the cloud on stale code — see §1's commit-and-push warning.)
 git pull
 
 # Re-extract the bundle if you haven't yet.
@@ -623,15 +661,27 @@ Verified offerings (April 2026):
 |---|---|---|---|---|---|
 | `gpu-h100-sxm` | `8gpu-128vcpu-1600gb` | 8x H100 80 GB SXM | 128 / 1600 GiB | ~$28/hr | `eu-north1` |
 | `gpu-h200-sxm` | `8gpu-128vcpu-1600gb` | 8x H200 141 GB SXM | 128 / 1600 GiB | ~$36-40/hr | `eu-north1`, `eu-north2`, `eu-west1`, `us-central1` |
+| `gpu-h200-sxm` | `1gpu-16vcpu-200gb` | 1x H200 141 GB SXM | 16 / 200 GiB | ~$5/hr | same regions; allocates reliably |
 
 **Default recommendation: 8x H100 SXM in `eu-north1`** — cheapest 8-GPU
 config that comfortably supports `++num_envs=4096-6144` per GPU for the X2
 BONES-SEED config. Pick the H200 preset if you need more VRAM headroom or a
 US/west-EU region for `scp` latency.
 
-The boot-disk image to use is `ubuntu24.04-cuda12` — Ubuntu 24.04 with
-NVIDIA driver 570.x and CUDA 12 already installed, which lets you skip
-driver install in Step 3.
+**Use the 1×H200 preset as a path-validation step.** When 8-GPU presets
+keep husking (B.4), allocate a 1-GPU H200 first (~30 s create, real
+public IP, real SSH access), run the bootstrap end-to-end on it, and
+either fine-tune small or hold the disk while you keep retrying for an
+8x slot in another region. This was the only path that worked on
+2026-04-28 when 8xH200 in `eu-west1` was advised "4/4 HIGH" but kept
+producing husks.
+
+The boot-disk image to use is **`ubuntu24.04-cuda13.0`** — Ubuntu 24.04
+with NVIDIA driver 580.x and CUDA 13 runtime already installed, which
+lets you skip driver install in Step 3. (The older `ubuntu24.04-cuda12`
+family was retired from `project-e00public-images` in April 2026 — see
+B.2. Our `torch 2.7.0+cu128` from `isaacsim==5.1.0.0` runs fine under
+the cuda13 driver via forward-compat.)
 
 ### A.3. Create the boot disk and instance
 
@@ -645,13 +695,14 @@ SUBNET_ID=$(nebius vpc subnet list --parent-id $PROJECT_ID --format json \
   | jq -r '.items[0].metadata.id')
 PUBKEY="$(cat ~/.ssh/id_ed25519.pub)"
 
-# 1. Provision the boot disk from the public Ubuntu 24.04 + CUDA 12 image.
+# 1. Provision the boot disk from the public Ubuntu 24.04 + CUDA 13 image.
+#    (cuda12 family was retired April 2026; cuda13.0 is the current default.)
 nebius compute disk create \
   --parent-id $PROJECT_ID \
   --name x2-train-h100-boot \
   --type network_ssd \
   --size-gibibytes 500 \
-  --source-image-family-image-family ubuntu24.04-cuda12 \
+  --source-image-family-image-family ubuntu24.04-cuda13.0 \
   --source-image-family-parent-id project-e00public-images
 DISK_ID=$(nebius compute disk get-by-name --parent-id $PROJECT_ID \
   --name x2-train-h100-boot --format json | jq -r '.metadata.id')
@@ -690,8 +741,13 @@ nebius compute instance create \
 Notes on the flags:
 
 - `--source-image-family-parent-id project-e00public-images`: that's
-  Nebius's catalog of public stock images. The `ubuntu24.04-cuda12`
-  family ships with NVIDIA driver 570.x and CUDA 12 already installed.
+  Nebius's catalog of public stock images. The `ubuntu24.04-cuda13.0`
+  family ships with NVIDIA driver 580.x and CUDA 13 already installed.
+  If you see `SourceImageFamily: Image family "..." not found`, the
+  family was renamed in the catalog — list current families with
+  `nebius compute image list --parent-id project-e00public-images
+  --format json | jq -r '.items[].spec.image_family'`, or inspect an
+  existing-disk's source via `nebius compute disk get --id <id>`.
 - `--network-interfaces '...public_ip_address...'`: assigns a public IP
   for `ssh`/`scp`. Drop the `public_ip_address` key if you have a
   bastion or VPN.
@@ -708,8 +764,14 @@ PUBLIC_IP=$(nebius compute instance get --id $INSTANCE_ID --format json \
 echo $PUBLIC_IP
 
 ssh ubuntu@$PUBLIC_IP
-nvidia-smi                                       # should show 8x H100, driver 570.x, CUDA 12
+nvidia-smi                                       # should show 8x H100, driver 580.x, CUDA 13
 ```
+
+> **Husk-detection check.** Even after `state: RUNNING` and a public IP
+> are reported, the GPU node may not actually exist. Run `bash -c
+> '</dev/tcp/$PUBLIC_IP/22 && echo open'` from your workstation; a real
+> instance opens port 22 within ~30 s of `RUNNING`, while a husk leaves
+> port 22 closed indefinitely. See B.4 for the full pattern.
 
 ### A.4. Adjustments to the main flow
 
@@ -717,7 +779,7 @@ When running the rest of this guide on a Nebius node:
 
 | Step in main guide | Nebius adjustment |
 |---|---|
-| Step 3 (Install Isaac Lab) | Skip the NVIDIA driver install — the `ubuntu24.04-cuda12` image already has it. The conda + Isaac Lab bits are unchanged. |
+| Step 3 (Install Isaac Lab) | Skip the NVIDIA driver install — the `ubuntu24.04-cuda13.0` image already has it. The conda + Isaac Lab bits are unchanged. |
 | Step 5 (`scp` bundle) | `scp /tmp/x2_cloud_bundle.tar.gz ubuntu@$PUBLIC_IP:~/` — at ~200 MB this finishes in 30-60 s on a typical home connection. |
 | Step 8 (Smoke test) | Defaults (`NUM_ENVS=4096`, 200 iters) work on every card we tested. |
 | Step 8b (Full run) | On H200 SXM (144 GB) we run `NUM_ENVS=16384` and measure 6.9 s/iter, 87% util, 48 GB used. On 80 GB H100 SXM, top out at `NUM_ENVS=8192` to keep some headroom for memory creep over multi-day runs. See §8b for a measured tuning table. |
@@ -805,10 +867,24 @@ The CLI version we tested (`0.12.204`) has a few mismatches with the
 ### B.2. Stock images live in `project-e00public-images`
 
 When creating a disk, the `--source-image-family-parent-id` is **not** your
-project — it's `project-e00public-images`. Stock families to pick from
-include `ubuntu24.04-cuda12`, `ubuntu24.04-cuda13.0`, and
-`ubuntu24.04-driverless`. The `mk8s-worker-node-...` families are for
-managed-Kubernetes nodes and shouldn't be used for VMs.
+project — it's `project-e00public-images`. Current stock families
+(verified 2026-04-28): `ubuntu24.04-cuda13.0` and
+`ubuntu24.04-driverless`. The `ubuntu24.04-cuda12` family was retired
+in April 2026; if a tutorial or older script references it, swap in
+`ubuntu24.04-cuda13.0`. (Our `torch 2.7.0+cu128` from
+`isaacsim==5.1.0.0` runs on either CUDA 12 or CUDA 13 driver via
+forward-compat, so the runtime difference is invisible.) The
+`mk8s-worker-node-...` families are for managed-Kubernetes nodes and
+shouldn't be used for VMs — even though their names mention `cuda12.8`,
+they are not drop-in replacements for the standalone `ubuntu24.04-*`
+families.
+
+To list the current catalog at any time:
+
+```bash
+nebius compute image list --parent-id project-e00public-images --format json \
+  | jq -r '.items[] | "\(.spec.image_family)\t\(.metadata.name)"' | sort -u
+```
 
 ### B.3. New-account permissions and billing
 
@@ -817,7 +893,7 @@ A freshly created tenant returns `PermissionDenied` on every
 attached. Add a card in the web console **before** the first CLI attempt
 or you'll spend 5 min debugging IAM that's actually a billing block.
 
-### B.4. Web form vs. CLI for the actual `instance create`
+### B.4. Web form vs. CLI for the actual `instance create` — and the husk pattern
 
 `gpu-h100-sxm` and `gpu-h200-sxm` (8 GPUs) are routinely fully booked in
 `eu-north1`. The CLI surfaces this as `NotEnoughResources` after a 5-min
@@ -834,10 +910,33 @@ the default in some flows is *no public IP*, leaving you with only the
 `10.x.x.x` internal address. Without it you can't `ssh`/`scp` from your
 workstation.
 
+**The "husk" failure mode (worse than `NotEnoughResources`).** Sometimes
+`instance create` returns success, the API reports `state: STOPPED`,
+and the disk binds to the instance — but the underlying GPU node was
+never actually scheduled. Calling `instance start` even bumps the state
+to `STARTING` → `RUNNING` and assigns a public IP, but TCP/22 stays
+closed forever. Telltale signs of a husk in `nebius compute instance
+get --id <id> --format json`:
+
+| Field | Husk | Real |
+|---|---|---|
+| `metadata.resource_version` | `1` (never advanced past create) | `>= 2` after a successful start |
+| `status.network_interfaces[0].public_ip_address` | `{}` (empty) on STOPPED, may "fill in" on STARTING but stays unreachable | populated and reachable on TCP/22 within ~30 s |
+| TCP probe `</dev/tcp/$IP/22` from workstation | times out indefinitely | opens within ~30 s |
+| `nvidia-smi` over SSH | never reachable | works |
+
+There's no charge for husks (Nebius bills only when the GPU is truly
+allocated), but they waste time. The fastest discriminator is the TCP/22
+probe — if it doesn't open within 60 s of `RUNNING`, it's a husk; stop
+the instance, optionally try a different region/preset, and don't
+bother running the bootstrap until SSH succeeds. The husk objects can
+sit indefinitely without cost; clean them up with `compute instance
+delete` when you're sure you don't want to keep retrying that slot.
+
 ### B.5. The web form's username vs. SSH key comment
 
 The Linux user that gets created on the VM is *not* the trailing
-`<user>@<host>` comment in your SSH key. For `ubuntu24.04-cuda12` the
+`<user>@<host>` comment in your SSH key. For `ubuntu24.04-cuda13.0` the
 default user is `ubuntu`. Set the username to `ubuntu` in the web form
 even if your key ends with `stickbot@laptop`.
 
@@ -932,7 +1031,7 @@ pip install "open3d==0.19.0" "tensordict==0.12.1" "vector-quantize-pytorch==1.28
 All three should also be added to `gear_sonic/pyproject.toml`'s
 `[training]` extra so future cloud spins don't trip on them.
 
-### B.10c. `libGLU.so.1` missing on `ubuntu24.04-cuda12`
+### B.10c. `libGLU.so.1` missing on `ubuntu24.04-cuda12/cuda13.0`
 
 Isaac Sim's optional Iray renderer plugin fails to load with
 `libGLU.so.1: cannot open shared object file`. By itself this is a
@@ -946,8 +1045,9 @@ sudo apt-get install -y libglu1-mesa
 ### B.10d. NVIDIA Vulkan ICD missing — Isaac Sim sees zero GPUs
 
 This is the **biggest** Nebius gotcha and the one that masquerades as a
-multi-GPU bug. The `ubuntu24.04-cuda12` image is a *compute-only* NVIDIA
-build: `libnvidia-compute-580` is installed but `libnvidia-gl-580` (which
+multi-GPU bug. Both `ubuntu24.04-cuda12` (retired April 2026) and the
+current `ubuntu24.04-cuda13.0` images are *compute-only* NVIDIA
+builds: `libnvidia-compute-580` is installed but `libnvidia-gl-580` (which
 ships `nvidia_icd.json` for Vulkan plus `libGLX_nvidia` / `libEGL_nvidia`)
 is **deliberately blocked** by an apt pin in
 `/etc/apt/preferences.d/nvidia-lock`:
@@ -1046,20 +1146,40 @@ env has the same warnings and trains fine. Ignore.
 
 ### B.13. Realistic timing (8x H200 SXM, fast network)
 
-| Step | Wall-clock (clean run with all fixes) |
-|---|---|
-| Bundle build (local) | <10 s |
-| Nebius CLI install + auth | ~3 min (mostly browser SSO) |
-| Disk create + instance create + boot | ~3-5 min |
-| `scp` 208 MB bundle | ~10 s (us-central1 from EU upload) |
-| miniconda install + repo clone + bundle extract | ~20 s |
-| `pip install isaacsim[all,extscache]==5.1.0.0` | ~5-7 min (mostly the 865 MB torch wheel) |
-| `isaaclab.sh -i` | ~3-4 min |
-| `pip install -e gear_sonic/[training]` | ~30 s |
-| `check_environment.py --training` | ~10 s |
+Bare timings, validated 2026-04-28 on a 1×H200 in `eu-west1` running
+the bootstrap script unattended. (8×H200 numbers are essentially
+identical for everything except `scp` bandwidth — the bottleneck is the
+torch wheel + IsaacLab clone, not GPU count.)
 
-Total: **~15-20 min from `nebius profile create` to a green smoke test**,
-assuming 8-GPU capacity is available on the first try.
+| Bootstrap phase | Wall-clock | Notes |
+|---|---|---|
+| 0–1 (pre-flight + apt) | ~30 s | hits Ubuntu mirrors |
+| 2 (NVIDIA Vulkan ICD pin override) | ~50 s | B.10d fix |
+| 3 (EULA env vars in `~/.bashrc`) | <1 s | |
+| 4 (Miniconda install) | ~10 s | |
+| 5 (conda ToS) | ~2 s | B.6 fix |
+| 6 (env_isaaclab create) | ~10 s | |
+| 7 (setuptools 80.9.0 + flatdict) | ~2 s | B.9 fix |
+| 8 (`isaacsim==5.1.0.0` + torch 2.7.0+cu128) | ~6 min | dominated by 7 GB wheel download |
+| 9 (IsaacLab v2.2.0 clone + install) | ~3 min | |
+| 10 (git-lfs init) | <1 s | |
+| 11 (GR00T repo clone + LFS pull meshes) | ~30 s | depends on REPO_BRANCH size |
+| 12 (`pip install -e gear_sonic[training]` + extras) | ~30 s | |
+| 13 (validation: vulkaninfo + Hydra dry-compose) | ~30 s | |
+| **Total bootstrap** | **~12–15 min** | from clean cuda13.0 disk |
+
+Add to that:
+
+| Step | Wall-clock |
+|---|---|
+| Local bundle build (incl. 211 MB bones_seed.pkl) | <5 s |
+| `scp` 211 MB bundle (home wifi → eu-west1) | ~50 s |
+| `scp` 380 MB checkpoint (when fine-tuning, §11b) | ~50 s |
+| Nebius `instance create` → SSH-able | ~30 s (1×H200) / ~2 min (8×H200, when capacity is real) |
+| Husk-detection wasted time when 8-GPU advice lies (B.4) | 5–60 min lost per husk; mitigate by 1×H200 first |
+
+Total: **~15–20 min from `nebius profile create` to a green smoke test**,
+assuming GPU capacity is available on the first try.
 
 ### B.14. Reusable artifacts
 
