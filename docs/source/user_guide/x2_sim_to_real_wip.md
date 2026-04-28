@@ -203,7 +203,7 @@ When sim-sim is sorted:
 
 ## Useful commands cheat sheet
 
-Powered run with current safest settings:
+### Powered run — current safest settings
 
 ```bash
 ./gear_sonic_deploy/deploy_x2.sh local \
@@ -214,6 +214,48 @@ Powered run with current safest settings:
     --return-seconds 2.0 \
     --log-dir /workspace/sonic/logs/x2/takesip_$(date +%Y%m%d_%H%M%S)
 ```
+
+### RAMP_OUT confirmation ladder (3 runs, used 2026-04-27)
+
+Use this exact sequence after any change to the deploy node to verify
+soft-exit + MC handoff still works. All three should print
+``RAMP_OUT (...s return-to-default)`` then ``RAMP_OUT complete``,
+followed by ``[cleanup] MC start_app POSTed.`` with no red flashing
+light when MC restarts. Walk a few steps after each run to confirm MC
+is happy.
+
+```bash
+# Run 1 — repeat of the known-good config (sanity check)
+./gear_sonic_deploy/deploy_x2.sh local \
+    --model /workspace/sonic/gear_sonic_deploy/models/x2_sonic_16k.onnx \
+    --motion /workspace/sonic/gear_sonic_deploy/data/motions_x2m2/x2_ultra_take_a_sip.x2m2 \
+    --autostart-after 5 --max-duration 5 \
+    --max-target-dev 0.30 --ramp-seconds 2.0 --tilt-cos -0.3 \
+    --log-dir /workspace/sonic/logs/x2/takesip_confirm1_$(date +%Y%m%d_%H%M%S)
+
+# Run 2 — longer in CONTROL so the policy ends up further off-default
+#         before RAMP_OUT fires. Stress-tests the lerp distance.
+./gear_sonic_deploy/deploy_x2.sh local \
+    --model /workspace/sonic/gear_sonic_deploy/models/x2_sonic_16k.onnx \
+    --motion /workspace/sonic/gear_sonic_deploy/data/motions_x2m2/x2_ultra_take_a_sip.x2m2 \
+    --autostart-after 5 --max-duration 8 \
+    --max-target-dev 0.30 --ramp-seconds 2.0 --tilt-cos -0.3 \
+    --log-dir /workspace/sonic/logs/x2/takesip_confirm2_$(date +%Y%m%d_%H%M%S)
+
+# Run 3 — slower return ramp to exercise the lerp at a different speed.
+#         3.0 s instead of the default 2.0 s.
+./gear_sonic_deploy/deploy_x2.sh local \
+    --model /workspace/sonic/gear_sonic_deploy/models/x2_sonic_16k.onnx \
+    --motion /workspace/sonic/gear_sonic_deploy/data/motions_x2m2/x2_ultra_take_a_sip.x2m2 \
+    --autostart-after 5 --max-duration 5 \
+    --max-target-dev 0.30 --ramp-seconds 2.0 --tilt-cos -0.3 --return-seconds 3.0 \
+    --log-dir /workspace/sonic/logs/x2/takesip_confirm3_$(date +%Y%m%d_%H%M%S)
+```
+
+If any of the three faults, grab the matching
+``logs/x2/takesip_confirm*_/tick.csv`` and check the ``ramp_out`` rows:
+``target_pos`` should converge linearly to ``default_angles`` within
+``return_seconds`` of the ``RAMP_OUT`` warn.
 
 IsaacLab single-step ground truth:
 
