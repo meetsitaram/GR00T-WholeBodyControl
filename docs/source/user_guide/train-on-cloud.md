@@ -49,6 +49,17 @@ For the X2 Ultra BONES-SEED training, the bundle contains:
 | `gear_sonic/data_process/build_x2_bones_seed_motion_lib.py` | Rebuild the PKL from retargeted CSVs | typically untracked |
 | `gear_sonic/scripts/play_x2_motion_mujoco.py` | Local MuJoCo kinematic replay | optional on a headless cloud |
 
+For the **sphere-foot sim2sim-gap experiment** (G18 follow-up; see §11), add:
+
+| Path | Purpose | Why not in git |
+|---|---|---|
+| `gear_sonic/data/assets/robot_description/urdf/x2_ultra/x2_ultra_sphere_feet.urdf` | 24-sphere foot URDF mirroring the MJCF foot collider | gitignored (`data/`) |
+
+The new Hydra entry `gear_sonic/config/exp/manager/universal_token/all_modes/sonic_x2_ultra_bones_seed_sphere_feet.yaml`,
+the `make_x2_ultra_cfg(...)` factory in `gear_sonic/envs/manager_env/robots/x2_ultra.py`,
+and the `++robot.foot` plumbing in `gear_sonic/envs/manager_env/modular_tracking_env_cfg.py`
+are tracked in git — commit + `git pull` on the cloud node and they'll be there.
+
 Build the bundle from the **repo root** so the tar paths match the cloud
 layout exactly:
 
@@ -59,12 +70,17 @@ tar -czf /tmp/x2_cloud_bundle.tar.gz \
     gear_sonic/data/motions/x2_ultra_body_check.pkl \
     gear_sonic/config/exp/manager/universal_token/all_modes/sonic_x2_ultra_bones_seed.yaml \
     gear_sonic/data_process/build_x2_bones_seed_motion_lib.py \
-    gear_sonic/scripts/play_x2_motion_mujoco.py
+    gear_sonic/scripts/play_x2_motion_mujoco.py \
+    gear_sonic/data/assets/robot_description/urdf/x2_ultra/x2_ultra_sphere_feet.urdf
 
 ls -lh /tmp/x2_cloud_bundle.tar.gz                # ~200 MB compressed
-tar -tzf /tmp/x2_cloud_bundle.tar.gz              # sanity: 5 paths
+tar -tzf /tmp/x2_cloud_bundle.tar.gz              # sanity: 6 paths
 sha256sum /tmp/x2_cloud_bundle.tar.gz             # capture for cloud-side verify
 ```
+
+Drop `x2_ultra_sphere_feet.urdf` from the list if you're not running the
+sphere-foot sim2sim experiment (§11). All other paths are needed by the
+core BONES-SEED training.
 
 Add or remove files as needed for your embodiment. The PKLs always need a
 side-channel because the source motion data is licensed; the configs and
@@ -85,7 +101,45 @@ recipe is stable.
 > appendices for turnkey provisioning recipes:
 > [Appendix A — Nebius](#appendix-a-provisioning-on-nebius).
 
+> **Tip — check Nebius capacity *before* `compute instance create`.** The
+> create call doesn't fail fast on no-capacity; it sits in the scheduler
+> queue for ~5 min and only then surfaces `NotEnoughResources`. Run
+> [`gear_sonic/scripts/cloud/nebius_gpu_scan.py`](../../../gear_sonic/scripts/cloud/nebius_gpu_scan.py)
+> first to pick a (region, platform) tuple with non-zero on-demand inventory:
+>
+> ```bash
+> python gear_sonic/scripts/cloud/nebius_gpu_scan.py --gpus 8 --min-on-demand 1
+> ```
+>
+> Output ends with a `Recommended:` line pointing at the highest-availability
+> (region, platform, preset) tuple that matches your filter. Use that
+> region/platform in the `compute instance create` call below — it's the
+> difference between "node ready in 2 min" and "scheduler timeout in 5 min".
+
 ## 3. Install Isaac Lab and create the conda env
+
+> **Tip — one-shot bootstrap.** If you're starting from a fresh boot disk
+> (deleted the previous one, new tenant, etc.), skip this section and §4
+> entirely and run
+> [`gear_sonic/scripts/cloud/bootstrap_fresh_node.sh`](../../../gear_sonic/scripts/cloud/bootstrap_fresh_node.sh)
+> instead. It bundles every fix in Appendix B (B.6 conda ToS, B.7 isaacsim
+> pin, B.8 EULA env, B.9 setuptools/flatdict, B.10b/c/d, B.11 git-lfs)
+> into 13 idempotent phases and ends at a passing Hydra dry-compose. ~15-20
+> min on a fresh `ubuntu24.04-cuda12` Nebius node:
+>
+> ```bash
+> # On your workstation, scp the script to the new node:
+> scp gear_sonic/scripts/cloud/bootstrap_fresh_node.sh ubuntu@$PUBLIC_IP:~/
+>
+> # On the cloud node:
+> ssh ubuntu@$PUBLIC_IP
+> REPO_URL=git@github.com:<your-fork>/GR00T-WholeBodyControl.git \
+>   bash ~/bootstrap_fresh_node.sh 2>&1 | tee ~/bootstrap.log
+> ```
+>
+> When it finishes, jump straight to §5 (`scp` bundle). The rest of §3 + §4
+> below is the manual walkthrough the script automates — read it for
+> background or for adapting to a non-Nebius cloud.
 
 Mirror the local development env (`env_isaaclab`). Follow the
 [Isaac Lab installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html).
@@ -373,6 +427,148 @@ the same training schedule or changing it.
 |---|---|---|
 | Same hyperparameters, picking up where you left off | `++resume=True ++experiment_dir=<full path to run dir>` | Reuses optimizer + LR scheduler state. Required when continuing the same run. |
 | Changing the iteration budget, the LR schedule, or finetuning into a different config | `+checkpoint=<path/to/model_step_NNNNNN.pt>` | Loads weights only, fresh optimizer/scheduler. Avoids the LR-discontinuity regression we hit when resuming with a changed iteration budget. |
+
+## 11. Sim2sim-gap experiment — fine-tune (or retrain) on the 24-sphere foot
+
+Background: G18 in [`sim2sim_mujoco.md`](sim2sim_mujoco.md) showed that the
+mesh-foot policy collapses the moment IsaacLab is moved to the 24-sphere
+foot collider that MuJoCo deploys against (progress 0.49, terminations
+0.67 at the 16k checkpoint vs 1.00 / 0.00 with mesh feet). The fix is to
+let the policy see the deployment-time contact geometry during training.
+
+> **Why not "true" per-episode mesh/sphere DR?** IsaacLab spawns one
+> `ArticulationCfg`, clones it across all envs (`replicate_physics=True`),
+> and can't swap the underlying collider per episode without significant
+> per-env-asset surgery. The practical equivalent — used here — is to
+> train *all* envs on the sphere URDF and let the existing per-env
+> friction DR (`physics_material.yaml`,
+> `static_friction_range: [0.3, 1.6]`) fan out the contact distribution
+> on top of the new geometry.
+
+The new Hydra entry that does this is
+`sonic_x2_ultra_bones_seed_sphere_feet.yaml`. It inherits everything
+from `sonic_x2_ultra_bones_seed` and only overrides
+`manager_env.config.robot.foot=sphere`. That single override routes the
+env spawn through `make_x2_ultra_cfg(foot="sphere")` (in
+`gear_sonic/envs/manager_env/robots/x2_ultra.py`) and loads
+`x2_ultra_sphere_feet.urdf`.
+
+### 11a. Pre-flight (cloud node)
+
+The repo-tracked changes (factory + Hydra plumbing + new config) come in
+via `git pull`. The gitignored URDF asset comes in via the bundle (you
+already added it to the tarball in §1):
+
+```bash
+cd ~/GR00T-WholeBodyControl
+
+# Make sure you're on the branch with the make_x2_ultra_cfg factory.
+git pull
+
+# Re-extract the bundle if you haven't yet.
+tar -xzf ~/x2_cloud_bundle.tar.gz
+
+# Sanity-check the new asset and config landed.
+ls -lh gear_sonic/data/assets/robot_description/urdf/x2_ultra/x2_ultra_sphere_feet.urdf
+ls -lh gear_sonic/config/exp/manager/universal_token/all_modes/sonic_x2_ultra_bones_seed_sphere_feet.yaml
+
+# Hydra dry-compose (confirms the override resolves).
+python gear_sonic/train_agent_trl.py \
+  --config-name=base \
+  +exp=manager/universal_token/all_modes/sonic_x2_ultra_bones_seed_sphere_feet \
+  --cfg job 2>&1 | grep -E "motion_file|num_envs|robot|project_name"
+# Expect:
+#   project_name: TRL_X2Ultra_BonesSeed_SphereFeet
+#   robot: { type: x2_ultra, foot: sphere }
+#   motion_file: gear_sonic/data/motions/x2_ultra_bones_seed.pkl
+```
+
+### 11b. Variant 1 — fine-tune the existing 16k mesh-trained checkpoint (recommended first)
+
+Fastest path to an answer: load the 16k mesh-trained weights with
+`+checkpoint=` (weight-only load, fresh optimizer / LR scheduler — see
+§10), and let the policy adapt to the sphere contact regime for a few
+thousand more iters.
+
+```bash
+# (cloud) Make sure the 16k mesh checkpoint is on the node. If you don't
+# already have it, scp it over from your workstation:
+#   scp ~/x2_cloud_checkpoints/run-20260420_083925/model_step_016000.pt \
+#       ubuntu@$PUBLIC_IP:~/x2_cloud_checkpoints/run-20260420_083925/
+ls -lh ~/x2_cloud_checkpoints/run-20260420_083925/model_step_016000.pt
+
+tmux new -d -s sphere_ft "
+  NUM_ENVS=8192 \
+  NUM_ITERS=4000 \
+  EXP_NAME=sonic_x2_ultra_bones_seed_sphere_feet \
+  EXTRA_FLAGS='+checkpoint=$HOME/x2_cloud_checkpoints/run-20260420_083925/model_step_016000.pt' \
+  USE_WANDB=False \
+  LOG_FILE=\$HOME/sphere_ft.log \
+  bash gear_sonic/scripts/cloud/run_smoke_8gpu.sh
+"
+tmux a -t sphere_ft     # attach; Ctrl-b d to detach
+```
+
+> `EXP_NAME` and `EXTRA_FLAGS` are forwarded into the Hydra invocation
+> by `run_smoke_8gpu.sh` (see the script's header comment for the full
+> override list). `EXTRA_FLAGS` is appended raw, so multi-flag values
+> like `EXTRA_FLAGS='+checkpoint=... ++algo.config.lr=5e-5'` are fine.
+
+Budget envelope (8x H200 SXM, `NUM_ENVS=8192`, ~4-5 s/iter):
+
+| Iters | Wall clock | Cost @ ~$30/hr |
+|---|---|---|
+| 2,000 (early signal) | ~2-3 hrs | ~$60-90 |
+| 4,000 (likely converged delta) | ~5-6 hrs | ~$150-180 |
+
+### 11c. Variant 2 — train from scratch on spheres (only if Variant 1 stalls)
+
+Same launcher pattern, no `+checkpoint=`, full 20-30k iter budget. Use
+this only after Variant 1 has shown the gap is closing — Variant 2
+costs ~$1k+ on H200 SXM and should not be the first attempt.
+
+```bash
+tmux new -d -s sphere_full "
+  NUM_ENVS=16384 \
+  NUM_ITERS=20000 \
+  EXP_NAME=sonic_x2_ultra_bones_seed_sphere_feet \
+  USE_WANDB=False \
+  LOG_FILE=\$HOME/sphere_full.log \
+  bash gear_sonic/scripts/cloud/run_smoke_8gpu.sh
+"
+```
+
+### 11d. Validating the result (after pulling the new checkpoint locally)
+
+```bash
+# (local) IsaacLab eval on spheres — confirms training transferred
+conda run -n env_isaaclab --no-capture-output python \
+  gear_sonic/scripts/sweep_isaac_mujoco_mirror.py \
+  --rows A0_isaac_stock A3_sphere_feet A5_full_mirror \
+  --checkpoint-root ~/x2_cloud_checkpoints/<sphere-feet-run-dir> \
+  --checkpoints <step>
+
+# (local) MuJoCo benchmark — the actual sim2sim measurement
+conda run -n env_mujoco --no-capture-output python \
+  gear_sonic/scripts/benchmark_motions_mujoco.py \
+  --checkpoint ~/x2_cloud_checkpoints/<sphere-feet-run-dir>/model_step_<step>.pt \
+  --motion-file gear_sonic/data/motions/x2_ultra_standing_only.pkl \
+  --num-motions 50 --seed 0 --max-seconds 6.0
+```
+
+What success looks like:
+
+- `A3_sphere_feet` row drops to <0.30 termination (was 0.67 with the
+  mesh-trained 16k policy).
+- MuJoCo `bench_step*.csv` mean survival on the standing benchmark
+  comes back up toward 4-6 s and **stops degrading** as iters increase
+  (MuJoCo currently goes 2.98s @ 2k → 2.12s @ 16k with the mesh-trained
+  policy; the sphere-trained policy should reverse that direction).
+
+If both checks pass, the sim2sim gap on the standing benchmark is closed
+and Open Work #1 in [`sim2sim_mujoco.md`](sim2sim_mujoco.md) graduates
+from "diagnosed" to "fixed". Walking motions (G17) are a separate bucket
+and likely still need the joint-DR pass from Open Work #2.
 
 ## Adapting this guide to a different embodiment / dataset
 

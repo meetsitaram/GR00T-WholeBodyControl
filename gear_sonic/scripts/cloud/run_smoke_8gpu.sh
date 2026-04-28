@@ -29,6 +29,11 @@
 #   MOTION_FILE     motion-lib PKL                      (default: stand-idle smoke)
 #   USE_WANDB       True/False                          (default: False)
 #   LOG_FILE        where to tee stdout                 (default: ~/smoke.log)
+#   EXP_NAME        Hydra +exp= leaf                    (default: sonic_x2_ultra_bones_seed)
+#                   Resolved as +exp=manager/universal_token/all_modes/$EXP_NAME
+#   EXTRA_FLAGS     additional Hydra flags appended raw (default: empty)
+#                   e.g. EXTRA_FLAGS="+checkpoint=/path/to/model_step_NNNNNN.pt"
+#                        EXTRA_FLAGS="++use_wandb=True ++algo.config.lr=5e-5"
 
 set -euo pipefail
 
@@ -38,6 +43,8 @@ NUM_ITERS=${NUM_ITERS:-200}
 MOTION_FILE=${MOTION_FILE:-gear_sonic/data/motions/x2_ultra_stand_idle_smoke.pkl}
 USE_WANDB=${USE_WANDB:-False}
 LOG_FILE=${LOG_FILE:-$HOME/smoke.log}
+EXP_NAME=${EXP_NAME:-sonic_x2_ultra_bones_seed}
+EXTRA_FLAGS=${EXTRA_FLAGS:-}
 
 exec > >(tee -a "$LOG_FILE") 2>&1
 echo "=== $(date) === SMOKE START"
@@ -46,6 +53,8 @@ echo "  num_envs/proc : $NUM_ENVS"
 echo "  iterations    : $NUM_ITERS"
 echo "  motion_file   : $MOTION_FILE"
 echo "  use_wandb     : $USE_WANDB"
+echo "  exp_name      : $EXP_NAME"
+echo "  extra_flags   : ${EXTRA_FLAGS:-<none>}"
 
 # Activate env_isaaclab (matches the install in train-on-cloud.md).
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
@@ -69,14 +78,16 @@ export OMNI_KIT_ACCEPT_EULA=YES
 export ACCEPT_EULA=Y
 export PRIVACY_CONSENT=Y
 
+# shellcheck disable=SC2086  # EXTRA_FLAGS is intentionally word-split.
 accelerate launch --num_processes="$NUM_PROCESSES" \
   gear_sonic/train_agent_trl.py \
   --config-name=base \
-  +exp=manager/universal_token/all_modes/sonic_x2_ultra_bones_seed \
+  "+exp=manager/universal_token/all_modes/$EXP_NAME" \
   ++num_envs="$NUM_ENVS" \
   ++headless=True \
   ++use_wandb="$USE_WANDB" \
   ++algo.config.num_learning_iterations="$NUM_ITERS" \
-  ++manager_env.commands.motion.motion_lib_cfg.motion_file="$MOTION_FILE"
+  ++manager_env.commands.motion.motion_lib_cfg.motion_file="$MOTION_FILE" \
+  $EXTRA_FLAGS
 
 echo "=== $(date) === SMOKE DONE"

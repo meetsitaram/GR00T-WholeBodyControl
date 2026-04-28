@@ -668,6 +668,81 @@ but makes the default block actually do what it says.
 Full per-motion table and discussion:
 `/home/stickbot/sim2sim_armature_eval/SUMMARY_compliant.md`.
 
+### G18. IsaacLab → MuJoCo mirror sweep — foot collider geometry IS the gap
+
+G11/G13/G15 all softened the **MuJoCo** side to look like IsaacLab and
+all reverted as net-zero or net-negative. G18 takes the opposite
+direction: **harden IsaacLab to look like MuJoCo** while reusing one
+already-trained checkpoint, and ask which single axis reproduces the
+MuJoCo failure mode inside Isaac.
+
+Plumbing added (all opt-in; default training behaviour unchanged):
+
+- `make_x2_ultra_cfg(actuator_regime, frictionloss, foot, ankle_kp_scale)`
+  factory in `gear_sonic/envs/manager_env/robots/x2_ultra.py`. Default
+  call (`make_x2_ultra_cfg()`) reproduces the previous `X2_ULTRA_CFG`
+  byte-for-byte.
+- Hydra parsing in `gear_sonic/envs/manager_env/modular_tracking_env_cfg.py`
+  for `++robot.actuator_regime`, `++robot.frictionloss`, `++robot.foot`,
+  `++robot.ankle_kp_scale`.
+- New asset `gear_sonic/data/assets/robot_description/urdf/x2_ultra/x2_ultra_sphere_feet.urdf`
+  with 24 spheres of `r=0.005` placed at the exact MJCF positions
+  (mirrored for the right foot).
+- Driver `gear_sonic/scripts/sweep_isaac_mujoco_mirror.py` running 6 rows
+  × 3 checkpoints on `x2_ultra_top15_standing.pkl` (15 motions, `num_envs=15`).
+
+Each invocation writes `sweep_<UTC-timestamp>_<rows>_<steps>.csv` and
+updates `latest.csv` (no overwrite). Per-cell `metrics_eval.json` and
+`run.log` live in `<row>/step_<step>/`.
+
+Results (`progress` = mean fraction of motion completed; `term` = fraction
+of envs hitting the fall terminator):
+
+| Row                 |  2k progress |  2k term |  6k progress |  6k term | 16k progress | 16k term |
+|---------------------|-------------:|---------:|-------------:|---------:|-------------:|---------:|
+| `A0_isaac_stock`    |        0.935 |    0.067 |        0.987 |    0.067 |        1.000 |    0.000 |
+| `A1_no_dr_no_noise` |        0.959 |    0.067 |        1.000 |    0.000 |        1.000 |    0.000 |
+| `A2_frictionloss`   |        0.959 |    0.067 |        1.000 |    0.000 |        1.000 |    0.000 |
+| **`A3_sphere_feet`**|    **0.409** |**0.933** |    **0.656** |**0.533** |    **0.493** |**0.667** |
+| `A4_explicit_pd`    |        1.000 |    0.000 |        1.000 |    0.000 |        1.000 |    0.000 |
+| `A5_full_mirror`    |        0.657 |    0.600 |        0.710 |    0.600 |        0.627 |    0.667 |
+
+Key takeaways:
+
+- **Stock IsaacLab does not reproduce the gap.** A0 holds 0.94 → 0.99 →
+  1.00 progress on 2k → 6k → 16k. The MuJoCo `2.98 → 2.12 s` survival
+  regression on the same checkpoints is invisible inside the trainer's
+  own simulator.
+- **Removing DR + observation-noise corruption does not unmask it.** A1
+  is essentially identical to A0 — the MuJoCo collapse is *not* "Isaac
+  was hiding the failure under noise".
+- **Joint `frictionloss=0.3` is a no-op for this policy** (A2 ≡ A1).
+- **Explicit PD + ankle KP × 1.5 is also a no-op alone** (A4 holds
+  100 %). Implicit-vs-explicit integrator (G5) and the deployment
+  ankle scale (G16b) are individually invisible on this 15-motion
+  subset *as long as the foot collider stays as PhysX mesh*.
+- **Foot-collider geometry is the dominant axis.** A3 alone drops Isaac
+  to 0.41 / 0.66 / 0.49 progress with 0.93 / 0.53 / 0.67 terminations
+  and pulls `min_progress` down to 0.038 at 2k. The 16k checkpoint is
+  the worst of the three under spheres — same direction as MuJoCo's
+  ladder.
+- **A5 (everything together) is slightly *less* catastrophic than A3
+  alone** (0.66 / 0.71 / 0.63 vs 0.41 / 0.66 / 0.49). The deployment-side
+  PD scaling baked from G16b is at least directionally compensating for
+  the contact-geometry hit.
+
+Conclusion: the failure mode MuJoCo reports is **contact-geometry
+driven**. G11 (sphere → box on the MJCF side) and G13 (sphere
+compliance tuning) failed because they were trying to fix the gap from
+the deployment side; the policy was trained against PhysX mesh-foot
+contact and that is structurally absent from MuJoCo. The intervention
+has to live in the **training distribution**, not in any further
+deployment-side MJCF tuning. See Open Work #1 below for the concrete
+follow-up.
+
+Full per-cell metrics, MUJOCO target spec, and reproduction commands:
+`/home/stickbot/sim2sim_armature_eval/isaaclab_mujoco_mirror/SUMMARY_isaac_mujoco_mirror.md`.
+
 ## Debugging Recipe: When IsaacLab Works but MuJoCo Doesn't
 
 1. **Dump the IsaacLab step-0 ground truth** with
@@ -697,7 +772,7 @@ Full per-motion table and discussion:
 | Robot tries to stand on its head | Quaternion sign convention or `quat_rotate_inverse` direction (G2) |
 | Arms float, legs over-respond | Single global action-scale instead of per-joint (G4) |
 | Walks fine for ~1 s then drifts | Tokenizer obs body-frame transform off (G9); motion phase clock not aligned with RSI frame (G10) |
-| Same checkpoint walks in IsaacLab, fails in MuJoCo | Always start with the dump-and-compare recipe above |
+| Same checkpoint walks in IsaacLab, fails in MuJoCo | Always start with the dump-and-compare recipe above. If proprio/tokenizer/encoder/decoder all match within tolerance, the residual is **foot collider geometry** (G18) — confirm by overriding the IsaacLab eval with `++robot.foot=sphere` and checking that the failure now reproduces inside Isaac. |
 | Robot stumbles on heel/toe contact, can't recover | Ankle PD authority — try `--kp-scale-ankle 1.5` (G16b, +0.5 s avg survival on 6k) or `--kp-scale 1.3` (broadband, equivalent gain); foot contact model gap (G11 / G13 — both tried, both negative); confirm armature is set per joint (G12) |
 | Joints feel sluggish at ankle/wrist or over-driven at hip | MJCF armature uniform / mismatched vs Isaac per-joint values (G12) |
 | Walking falls in 2–3 s while standing/squat motions hold | **Not** a deployment-PD problem — G17 swept waist KP (×3, ×5) and knee KP/KD on walks and every config either tied or regressed against baseline. Walking gait is bottlenecked by training data / joint-dynamics DR coverage, not deployed gains. Visual "waist looks weak / knee looks stiff" reflects the policy's *learned* coordination, not a missing torque budget |
@@ -708,17 +783,26 @@ Documented for future contributors picking up this thread. None of the
 items below are blocking deployment, but they are the most likely
 remaining sources of the residual gap visible after applying G1–G12.
 
-1. **Foot contact regime mismatch (see G11, G13).** PhysX rigid-mesh +
-   patch-friction during training vs MuJoCo discrete-sphere `condim=3`
-   at deployment. Two single-axis interventions tried and reverted:
-   geometry rewrite (G11: spheres → box) and compliance-only tuning
-   (G13: solref/solimp/condim/friction on the same spheres). Remaining
-   paths, neither tried yet:
-   - *Deployment side:* mesh-based foot collider in the MJCF matched
-     against the IsaacSim URDF foot mesh (i.e. fix geometry *and*
-     contact regime jointly, since varying them independently failed).
-   - *Training side:* domain randomization over foot friction tuple,
-     restitution, and (if feasible) a proxy for contact patch geometry.
+1. **Foot contact regime mismatch (see G11, G13, and now G18 — confirmed
+   dominant).** PhysX rigid-mesh + patch-friction during training vs
+   MuJoCo discrete-sphere `condim=3` at deployment. **G18 closed the
+   diagnostic loop:** mirroring the 24-sphere foot collider into IsaacLab
+   reproduces the MuJoCo collapse (0.41 / 0.66 / 0.49 progress on
+   2k/6k/16k vs 1.0 / 1.0 / 1.0 with the stock mesh foot), while none
+   of the other axes (frictionloss, explicit PD, ankle ×1.5) move
+   IsaacLab off 100 % when applied alone. The only remaining
+   intervention is on the **training side**:
+   - *Primary*: train (or fine-tune) on `x2_ultra_sphere_feet.urdf` so
+     the policy sees the deployment-time contact regime during learning.
+   - *Alternative*: episode-reset randomization between mesh-foot and
+     sphere-foot URDFs (e.g. 50/50 or 70/30 in favour of spheres) so
+     the policy learns a foot-geometry-invariant gait.
+   - *Secondary*: add foot friction tuple + restitution DR on top of
+     the geometry change (cheap, complementary).
+   Deployment-side mesh-vs-mesh attempts (matching the MJCF foot to the
+   PhysX mesh) are no longer the recommended path: G18 shows the policy
+   can't tolerate the sphere geometry no matter how the friction or PD
+   is tuned.
 2. **Joint-dynamics domain randomization.** The current training run
    randomizes mass, CoM, push, observation noise, but **not** joint
    armature/damping. Per-motion benchmark variance under G12 (some
