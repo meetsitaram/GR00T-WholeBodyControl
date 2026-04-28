@@ -198,11 +198,34 @@ def _install_env_state_patch():
                     "default_joint_pos": robot.data.default_joint_pos.detach().cpu(),
                 }
 
-                # Try to capture motion-command info too
+                # Capture motion-command info. TrackingCommand doesn't expose
+                # ``motion_times`` directly; what it has is integer time-step
+                # counters: ``motion_start_time_steps`` (per-env start frame
+                # sampled at episode reset) plus ``time_steps`` (frames
+                # elapsed since reset). Convert to seconds via
+                # ``motion_lib._sim_fps`` (= 1 / step_dt). The MuJoCo
+                # comparator needs ``motion_times`` to sample the same frame
+                # of the same .pkl that IsaacLab fed the policy.
                 try:
                     cmd = inner_env.command_manager.get_term("motion")
                     gt["motion_ids"] = cmd.motion_ids.detach().cpu()
-                    gt["motion_times"] = cmd.motion_times.detach().cpu()
+                    if hasattr(cmd, "motion_start_time_steps") and hasattr(cmd, "time_steps"):
+                        cur_time_steps = (
+                            cmd.motion_start_time_steps + cmd.time_steps
+                        ).detach().cpu()
+                        gt["motion_time_steps"] = cur_time_steps
+                        # _sim_fps is private but stable across the codebase
+                        sim_fps = float(getattr(cmd.motion_lib, "_sim_fps", 50.0))
+                        gt["motion_sim_fps"] = sim_fps
+                        gt["motion_times"] = cur_time_steps.float() / sim_fps
+                    elif hasattr(cmd, "motion_times"):
+                        # Future-proof: if a TrackingCommand subclass adds it
+                        gt["motion_times"] = cmd.motion_times.detach().cpu()
+                    else:
+                        print("[dump_isaaclab_step0] Warning: TrackingCommand has "
+                              "neither motion_start_time_steps/time_steps nor "
+                              "motion_times. Comparator will need motion_t=0.",
+                              flush=True)
                     if hasattr(cmd, "future_motion_ids"):
                         gt["future_motion_ids"] = cmd.future_motion_ids.detach().cpu()
                     if hasattr(cmd, "future_time_steps"):
