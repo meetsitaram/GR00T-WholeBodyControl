@@ -499,30 +499,28 @@ def main(override_config: omegaconf.OmegaConf):
 
         if "tokenizer" in example_obs_dict and has_encoders:
 
-            inference_helpers.export_universal_token_module_as_onnx(
-                model.policy.actor_module,
-                encoder_name="smpl",
-                decoder_name="g1_dyn",
-                path=exported_policy_path,
-                exported_model_name=exported_onnx_name.replace(".onnx", "_smpl.onnx"),
-                batch_size=1,
+            available_encoders = set(
+                getattr(model.policy.actor_module, "encoder_input_features", {}).keys()
             )
-            inference_helpers.export_universal_token_module_as_onnx(
-                model.policy.actor_module,
-                encoder_name="g1",
-                decoder_name="g1_dyn",
-                path=exported_policy_path,
-                exported_model_name=exported_onnx_name.replace(".onnx", "_g1.onnx"),
-                batch_size=1,
-            )
-            inference_helpers.export_universal_token_module_as_onnx(
-                model.policy.actor_module,
-                encoder_name="teleop",
-                decoder_name="g1_dyn",
-                path=exported_policy_path,
-                exported_model_name=exported_onnx_name.replace(".onnx", "_teleop.onnx"),
-                batch_size=1,
-            )
+            for enc_name, suffix in (
+                ("smpl", "_smpl.onnx"),
+                ("g1", "_g1.onnx"),
+                ("teleop", "_teleop.onnx"),
+            ):
+                if enc_name not in available_encoders:
+                    logger.warning(
+                        f"Skipping ONNX export for missing encoder '{enc_name}' "
+                        f"(available: {sorted(available_encoders)})"
+                    )
+                    continue
+                inference_helpers.export_universal_token_module_as_onnx(
+                    model.policy.actor_module,
+                    encoder_name=enc_name,
+                    decoder_name="g1_dyn",
+                    path=exported_policy_path,
+                    exported_model_name=exported_onnx_name.replace(".onnx", suffix),
+                    batch_size=1,
+                )
 
             inference_helpers.export_universal_token_encoders_as_onnx(
                 model.policy.actor_module,

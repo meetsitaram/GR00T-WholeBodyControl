@@ -125,6 +125,10 @@ Documentation
    references/conventions
    references/training_code
    references/deployment_code
+   references/x2_deployment_code
+   user_guide/x2_sonic_deploy_real
+   user_guide/x2_first_real_robot
+   user_guide/x2_sim_to_real_wip
    references/observation_config
    references/motion_reference
    references/planner_onnx
