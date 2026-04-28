@@ -534,8 +534,16 @@ def build_tokenizer_obs(motion_data, current_time, base_quat_wxyz, motion_fps):
     jvel_frames = []  # each (31,) in IL order
     ori_frames = []   # each (6,) 6D rotation diff
 
+    # NOTE: future window starts at the CURRENT motion frame (t + 0.0), then
+    # steps forward by DT_FUTURE_REF. IsaacLab uses
+    # ``arange(num_future_frames) * frame_skips`` as the offset (see
+    # ``TrackingCommand.future_time_steps_init`` in
+    # ``gear_sonic/envs/manager_env/mdp/commands.py:354``), so frame 0 is the
+    # robot's current motion frame, NOT the first future frame at t + 0.1.
+    # An earlier version of this loop used ``(f + 1) * DT_FUTURE_REF`` and
+    # was off by one.
     for f in range(NUM_FUTURE_FRAMES):
-        future_time = current_time + (f + 1) * DT_FUTURE_REF
+        future_time = current_time + f * DT_FUTURE_REF
         fi = min(int(future_time / dt), total_frames - 1)
 
         jpos_il = m["dof"][fi][IL_TO_MJ_DOF]
