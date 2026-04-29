@@ -83,6 +83,14 @@ def main():
     parser.add_argument("--render-fps", type=int, default=50,
                         help="Output video FPS (default 50 = 1 frame/control step).")
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--mjcf", default=None,
+                        help="Override MJCF path. Used by Phase 5 sim2sim "
+                             "ablation audits to A/B variant MJCFs without "
+                             "editing the canonical x2_ultra.xml. Defaults to "
+                             "MJCF_PATH from eval_x2_mujoco.")
+    parser.add_argument("--no-render", action="store_true",
+                        help="Skip MP4 writing; just run the sim and report "
+                             "fall time. ~5-10x faster for headless A/B audits.")
     args = parser.parse_args()
 
     print(f"Loading actor from {args.checkpoint} ...", flush=True)
@@ -99,8 +107,9 @@ def main():
     print(f"  {mk}: {total_frames} frames @ {motion_fps:.0f} fps "
           f"= {total_frames/motion_fps:.1f}s", flush=True)
 
-    print("Loading MuJoCo model ...", flush=True)
-    mj_model = mujoco.MjModel.from_xml_path(MJCF_PATH)
+    mjcf_path = args.mjcf or MJCF_PATH
+    print(f"Loading MuJoCo model from {mjcf_path} ...", flush=True)
+    mj_model = mujoco.MjModel.from_xml_path(mjcf_path)
     mj_model.opt.timestep = SIM_DT
     # Bump offscreen framebuffer to match requested render size. The X2 MJCF
     # ships with the MuJoCo default (640x480) which caps the Renderer.
@@ -113,14 +122,18 @@ def main():
     init_root_z = float(init_state["root_pos_w"][2])
     apply_init_state(mj_model, mj_data, init_state)
 
-    renderer = mujoco.Renderer(mj_model, height=args.height, width=args.width)
-    cam = mujoco.MjvCamera()
-    cam.azimuth = args.cam_azimuth
-    cam.elevation = args.cam_elevation
-    cam.distance = args.cam_distance
-    cam.lookat[:] = [0.0, 0.0, init_root_z]
-    cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
-    cam.trackbodyid = pelvis_id
+    if args.no_render:
+        renderer = None
+        cam = None
+    else:
+        renderer = mujoco.Renderer(mj_model, height=args.height, width=args.width)
+        cam = mujoco.MjvCamera()
+        cam.azimuth = args.cam_azimuth
+        cam.elevation = args.cam_elevation
+        cam.distance = args.cam_distance
+        cam.lookat[:] = [0.0, 0.0, init_root_z]
+        cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+        cam.trackbodyid = pelvis_id
 
     prop_buf = ProprioceptionBuffer()
     last_action_mj = np.zeros(NUM_DOFS, dtype=np.float32)
@@ -137,15 +150,19 @@ def main():
     effective_fps = control_hz // stride
 
     total_steps = int(args.duration * control_hz)
-    print(f"Rolling out {args.duration:.1f}s ({total_steps} control steps), "
-          f"writing {args.out} @ {effective_fps} fps "
-          f"({total_steps // stride} frames, ~{args.width}x{args.height})",
-          flush=True)
-
-    writer = imageio.get_writer(
-        args.out, fps=effective_fps, codec="libx264",
-        macro_block_size=1, quality=8,
-    )
+    if args.no_render:
+        print(f"Rolling out {args.duration:.1f}s ({total_steps} control steps), "
+              f"NO render (fall-time only)", flush=True)
+        writer = None
+    else:
+        print(f"Rolling out {args.duration:.1f}s ({total_steps} control steps), "
+              f"writing {args.out} @ {effective_fps} fps "
+              f"({total_steps // stride} frames, ~{args.width}x{args.height})",
+              flush=True)
+        writer = imageio.get_writer(
+            args.out, fps=effective_fps, codec="libx264",
+            macro_block_size=1, quality=8,
+        )
 
     fall_frame = None
     try:
@@ -196,7 +213,7 @@ def main():
                     print(f"  [fall] at step {step}, t={step*CONTROL_DT:.2f}s "
                           f"(pelvis_z={pelvis_z:.2f})", flush=True)
 
-            if step % stride == 0:
+            if writer is not None and step % stride == 0:
                 renderer.update_scene(mj_data, camera=cam)
                 frame = renderer.render()
                 writer.append_data(frame)
@@ -205,11 +222,14 @@ def main():
                 print(f"  step {step}/{total_steps}  t={step*CONTROL_DT:.2f}s  "
                       f"pelvis_z={float(mj_data.qpos[2]):.3f}", flush=True)
     finally:
-        writer.close()
-        renderer.close()
+        if writer is not None:
+            writer.close()
+        if renderer is not None:
+            renderer.close()
 
     tag = "survived" if fall_frame is None else f"fell @ {fall_frame*CONTROL_DT:.2f}s"
-    print(f"\nDone. {tag}. Wrote {args.out}", flush=True)
+    out_msg = f". Wrote {args.out}" if writer is not None else ""
+    print(f"\nDone. {tag}{out_msg}", flush=True)
 
 
 if __name__ == "__main__":

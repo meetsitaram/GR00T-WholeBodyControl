@@ -743,6 +743,77 @@ follow-up.
 Full per-cell metrics, MUJOCO target spec, and reproduction commands:
 `/home/stickbot/sim2sim_armature_eval/isaaclab_mujoco_mirror/SUMMARY_isaac_mujoco_mirror.md`.
 
+#### G18b. Lessons learned — the fix was already in the upstream package
+
+After G18 pinpointed foot-collider geometry as the dominant axis, we
+hand-authored `x2_ultra_sphere_feet.urdf` (24 spheres, `r=0.005`, exact
+MJCF positions) and ran a 2k-iter fine-tune of the 16k mesh-trained
+policy on it. Diagnostic against the 2k checkpoint:
+
+- IsaacLab `A0_isaac_stock` (mesh feet): progress **0.99 → 0.944** (−5pp,
+  no catastrophic forgetting).
+- IsaacLab `A3_sphere_feet`: progress **0.49 → 0.981** (+49pp, gap
+  essentially closed).
+- MuJoCo time-to-fall on `Relaxed_walk_forward_002__A057_M_postfix`:
+  **2.22 s → 5.12 s** (+131 %).
+- MuJoCo time-to-fall on the canonical hard motion
+  `standing__eat_icecream_fall_standing_R_001__A456_M`:
+  **2.14 s → 3.20 s** (+50 %).
+
+Then, while writing this section up, an audit of the upstream AgiBot
+`X2_URDF-v1.3.0` drop revealed the *real* postmortem:
+
+| Upstream file | Foot collision | Used by |
+|---|---|---|
+| `x2_ultra.urdf` | mesh (CAD STL) | **What we picked for IsaacLab.** |
+| `x2_ultra_simple_collision.urdf` | **24 spheres (12/foot)** | Nothing — sat unused next to the file we picked. |
+| `x2_ultra.xml` (MJCF) | 24 spheres (12/foot) | MuJoCo deploy. |
+
+The 12 sphere positions in our hand-written `x2_ultra_sphere_feet.urdf`
+are byte-identical to the ones in AgiBot's pre-existing
+`x2_ultra_simple_collision.urdf`. We re-derived the upstream file
+without realising it existed.
+
+**Lesson 1 — audit the entire upstream drop, not just the
+obvious-named file.** AgiBot shipped three robot descriptors side-by-side
+(`x2_ultra.urdf`, `x2_ultra_simple_collision.urdf`, `x2_ultra.xml`).
+The GR00T integration grabbed `x2_ultra.urdf` because of the obvious
+name and never opened the other two. The naming `simple_collision` is
+a perfect hint — that's literally "the URDF with simplified collision
+primitives for sim." A 30-second `diff` of the foot-link `<collision>`
+sections of the URDF and the MJCF would have caught the mismatch on day
+one.
+
+**Lesson 2 — own the URDF↔MJCF coherence.** The URDF was for the
+training team and the MJCF was for the deploy/eval team, and nobody
+owned "make sure these two describe the same robot." That gap is what
+let a 12-sphere-vs-mesh discrepancy survive ~2 weeks of training,
+multiple `G14` / `G16` / `G13` deployment-side experiments, and only
+got pinned by the G18 ablation. From now on, **every robot integration
+should ship a `MUJOCO_REFERENCE.md`-style table that diffs URDF vs
+MJCF on every contact-relevant link** (collision geom type/count,
+friction, armature, damping, effort limits) before any training run is
+launched.
+
+**Lesson 3 — make the choice explicit at config time, not implicit at
+filesystem time.** The new `make_x2_ultra_cfg(foot=...)` factory + Hydra
+`++robot.foot=sphere|mesh` switch promotes the foot-collider choice from
+"a hidden assumption baked into a path" to "a visible knob that shows
+up in every training config and every eval run." Future trainees will
+see two URDFs and a knob, not one URDF and a hidden default. This same
+pattern should be applied to any future "two equally-valid upstream
+files" decision (actuator regime, friction model, motor layout, …).
+
+**Followups (tracked in Open Work below):**
+
+1. Replace our hand-written `x2_ultra_sphere_feet.urdf` with a verbatim
+   copy of AgiBot's `x2_ultra_simple_collision.urdf` so future upstream
+   bumps land as a clean git diff and we inherit any other simplified
+   collision tweaks they made (e.g. on hip/knee links).
+2. After the 4k fine-tune validates against MuJoCo, flip the default in
+   `gear_sonic/envs/manager_env/robots/x2_ultra.py` from `foot="mesh"`
+   to `foot="sphere"`, demoting the mesh URDF to opt-in.
+
 ## Debugging Recipe: When IsaacLab Works but MuJoCo Doesn't
 
 1. **Dump the IsaacLab step-0 ground truth** with
