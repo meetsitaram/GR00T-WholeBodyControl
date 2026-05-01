@@ -20,10 +20,13 @@ import argparse
 import sys
 from pathlib import Path
 
+import csv
+
 import imageio
 import mujoco
 import numpy as np
 import torch
+from scipy.spatial.transform import Rotation as Rot
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
@@ -91,6 +94,11 @@ def main():
     parser.add_argument("--no-render", action="store_true",
                         help="Skip MP4 writing; just run the sim and report "
                              "fall time. ~5-10x faster for headless A/B audits.")
+    parser.add_argument("--traj-csv", default=None,
+                        help="If set, dump per-control-step trajectory CSV: "
+                             "t, robot_{x,y,z,yaw_deg}, ref_{x,y,z,yaw_deg}, "
+                             "ref_motion_frame, pelvis_z. Used to debug heading/"
+                             "direction drift between IsaacLab and MuJoCo.")
     args = parser.parse_args()
 
     print(f"Loading actor from {args.checkpoint} ...", flush=True)
@@ -150,6 +158,28 @@ def main():
     effective_fps = control_hz // stride
 
     total_steps = int(args.duration * control_hz)
+    # Pre-extract motion world-frame xy + yaw for reference logging. The motion
+    # was recorded with a non-zero starting world XY (we discard it at RSI by
+    # zeroing qpos[0:2]) so we shift by `ref_xy0` to put the ref trajectory in
+    # the same robot-spawned frame (origin = motion frame init_frame world XY).
+    ref_world_xy = np.asarray(motion_entry["root_trans_offset"], dtype=np.float64)[:, :2]
+    ref_xy0 = ref_world_xy[int(args.init_frame)].copy()
+    ref_world_quat_xyzw = np.asarray(motion_entry["root_rot"], dtype=np.float64)
+    ref_world_yaw = Rot.from_quat(ref_world_quat_xyzw).as_euler("ZYX")[:, 0]
+    csv_fp = None
+    csv_writer = None
+    if args.traj_csv is not None:
+        csv_fp = open(args.traj_csv, "w", newline="")
+        csv_writer = csv.writer(csv_fp)
+        csv_writer.writerow([
+            "step", "t",
+            "robot_x", "robot_y", "robot_z", "robot_yaw_deg",
+            "ref_x", "ref_y", "ref_z", "ref_yaw_deg",
+            "ref_motion_frame", "pelvis_z",
+            "robot_lin_vel_x_w", "robot_lin_vel_y_w",
+        ])
+        print(f"Trajectory CSV -> {args.traj_csv}", flush=True)
+
     if args.no_render:
         print(f"Rolling out {args.duration:.1f}s ({total_steps} control steps), "
               f"NO render (fall-time only)", flush=True)
@@ -213,6 +243,32 @@ def main():
                     print(f"  [fall] at step {step}, t={step*CONTROL_DT:.2f}s "
                           f"(pelvis_z={pelvis_z:.2f})", flush=True)
 
+            if csv_writer is not None:
+                # Robot world-frame state (qpos[0:2] starts at 0 by RSI).
+                rx, ry, rz = (float(mj_data.qpos[0]), float(mj_data.qpos[1]),
+                              float(mj_data.qpos[2]))
+                bq_wxyz = mj_data.qpos[3:7]
+                bq_xyzw = [bq_wxyz[1], bq_wxyz[2], bq_wxyz[3], bq_wxyz[0]]
+                robot_yaw = Rot.from_quat(bq_xyzw).as_euler("ZYX")[0]
+                # Motion-side reference (in robot-spawn frame, i.e. shifted by
+                # ref_xy0 so frame=init_frame lands at xy=(0,0) just like the
+                # robot does). Note: we don't rotate the motion XY into the
+                # robot's spawn yaw — we keep both in the original motion-world
+                # yaw frame so drift in robot yaw is visible directly.
+                ref_xy_now = ref_world_xy[motion_frame] - ref_xy0
+                ref_z = float(motion_entry["root_trans_offset"][motion_frame, 2])
+                ref_yaw = float(ref_world_yaw[motion_frame])
+                csv_writer.writerow([
+                    step, f"{step*CONTROL_DT:.4f}",
+                    f"{rx:.5f}", f"{ry:.5f}", f"{rz:.5f}",
+                    f"{np.degrees(robot_yaw):.3f}",
+                    f"{ref_xy_now[0]:.5f}", f"{ref_xy_now[1]:.5f}",
+                    f"{ref_z:.5f}", f"{np.degrees(ref_yaw):.3f}",
+                    motion_frame, f"{rz:.5f}",
+                    f"{float(mj_data.qvel[0]):.5f}",
+                    f"{float(mj_data.qvel[1]):.5f}",
+                ])
+
             if writer is not None and step % stride == 0:
                 renderer.update_scene(mj_data, camera=cam)
                 frame = renderer.render()
@@ -226,6 +282,8 @@ def main():
             writer.close()
         if renderer is not None:
             renderer.close()
+        if csv_fp is not None:
+            csv_fp.close()
 
     tag = "survived" if fall_frame is None else f"fell @ {fall_frame*CONTROL_DT:.2f}s"
     out_msg = f". Wrote {args.out}" if writer is not None else ""

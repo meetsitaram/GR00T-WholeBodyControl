@@ -247,6 +247,17 @@ For X2 with 10 future frames at 0.1 s spacing the total dim is
 `10 × 68 = 680`. Frame width depends on the tokenizer observation
 group; see `gear_sonic/config/manager_env/observations/tokenizer/`.
 
+**🚨 6D rotation flatten ordering MUST match training (G20).** The
+`motion_anchor_ori_b_mf_nonflat` channel takes the first two columns
+of a 3×3 rotation matrix and flattens them. IsaacLab uses
+`mat[..., :2].reshape(-1)` (row-major: `[m00, m01, m10, m11, m20, m21]`).
+A naive `concatenate([col0, col1])` (column-major:
+`[m00, m10, m20, m01, m11, m21]`) yields the same six numbers in a
+different order — the policy reads the channels as if it were given
+a fictitious large yaw error and steers the robot 180° in 1–2 s.
+This was a real bug in `eval_x2_mujoco.py` for many months; see G20
+for the full story.
+
 ### G10. RSI is the proper reset, not a clean spawn
 
 IsaacLab does **not** start episodes with the robot standing in its
@@ -814,6 +825,101 @@ files" decision (actuator regime, friction model, motor layout, …).
    `gear_sonic/envs/manager_env/robots/x2_ultra.py` from `foot="mesh"`
    to `foot="sphere"`, demoting the mesh URDF to opt-in.
 
+### G20. Deploy-side 6D rotation channel-order bug — root cause of every "robot turns 180°" report
+
+**TL;DR.** The dominant MuJoCo failure mode in every prior debug session
+("policy collapses in 2–5 s; robot turns back and walks the opposite
+direction") was **not a sim-to-sim physics gap**. It was a 6D rotation
+flatten-ordering bug in
+[`gear_sonic/scripts/eval_x2_mujoco.py::build_tokenizer_obs`](../../gear_sonic/scripts/eval_x2_mujoco.py)
+that has been present since the script was first written.
+
+**The bug.** `motion_anchor_ori_b_mf_nonflat` is a 6-vector per future
+frame, derived from the first two columns of a 3×3 rotation matrix.
+IsaacLab training builds it row-major:
+
+```python
+# gear_sonic/envs/manager_env/mdp/commands.py::root_rot_dif_l_multi_future
+mat = matrix_from_quat(root_rot_dif)            # (..., 3, 3)
+out = mat[..., :2].reshape(num_envs, -1)        # row-major flatten of (3, 2)
+                                                # → [m00, m01, m10, m11, m20, m21]
+```
+
+The MuJoCo eval was building it column-major:
+
+```python
+# gear_sonic/scripts/eval_x2_mujoco.py::build_tokenizer_obs (BUGGY)
+rot_mat = relative.as_matrix()
+ori_6d  = np.concatenate([rot_mat[:, 0], rot_mat[:, 1]])   # → [m00, m10, m20, m01, m11, m21]
+```
+
+Same six numbers, scrambled positions: indices `(1, 2, 3, 4)` are
+permuted to `(2, 4, 1, 3)`. To the policy, the heading channel was
+gibberish — a fictitious large yaw error appeared on every step.
+
+**The symptom map.**
+
+- Robot spawns matching the motion's first-frame world heading (RSI is
+  fine).
+- Within 0.5 s the policy starts commanding a yaw correction.
+- Within 1–2 s the robot has rotated 140°–180° in world frame.
+- The robot then walks in the new (wrong) direction until it falls.
+- Standing motions don't show the failure (the policy never tries to
+  translate, so the bad heading signal doesn't get amplified).
+
+**Diagnostic data (iter 761 of the H200 sphere-feet run, 3 motions,
+20 s headless rollouts):**
+
+| motion         | max\|robot − ref yaw\| in 0–5 s | robot travel direction (0–5 s) | ref direction |
+|---|---:|---:|---:|
+| `relaxed_walk_postfix` | **179.9°** | **+57.5°** (NE, 1.0 m) | −87.6° (S, 3.1 m) |
+| `walk_forward`         | 134.7°    | −92.6° (1.0 m)         | −97.1° (0.78 m)  |
+| `take_a_sip`           | 11.0°     | (stationary)           | (stationary)     |
+
+The 145° direction error on `relaxed_walk` between robot travel and ref
+travel is a smoking gun that no contact-side physics gap can produce.
+
+**The fix** — one line:
+
+```python
+# Was:
+ori_6d = np.concatenate([rot_mat[:, 0], rot_mat[:, 1]]).astype(np.float32)
+# Is now:
+ori_6d = rot_mat[:, :2].reshape(-1).astype(np.float32)
+```
+
+**Post-fix validation** (same checkpoint, same motions, same physics):
+
+| motion       | BEFORE fix      | AFTER fix         | yaw drift (0–5 s) |
+|---|---:|---:|---:|
+| `relaxed_walk_postfix` | fell @ 13.9 s | **survived 20 s**, travelled **2.6 m of 3.1 m expected** | 8.8° (was 179.9°) |
+| `take_a_sip`           | fell @ 8.4 s  | **survived 20 s**                                        | 5.0° |
+| `walk_forward`         | fell @ 1.0 s  | fell @ 1.4 s (different failure mode now: real balance, not heading) | 18.7° |
+
+**How to catch it earlier next time.** The dump-and-compare recipe (top
+of next section) catches obs/encoder/decoder divergences within
+tolerance — but channel permutation produces *the same numbers in
+different positions*, so a tolerance-based comparator can pass even
+with the bug active. Add an **element-wise positional assertion** at
+step 0 against an IsaacLab dump, not just a tolerance check, for any
+fixed-layout channel like a flattened rotation matrix.
+
+**Followups.**
+
+- ☐ Audit the C++ / on-device deploy stack
+  (`gear_sonic/scripts/eval_x2_mujoco_onnx.py` is fine — it imports
+  `build_tokenizer_obs` directly) for the same column-vs-row-major
+  assumption.
+- ☐ Re-run the multi-init MuJoCo bench under the fix to get clean
+  post-fix baselines for the 16 k mesh, 4 k sphere fine-tune, and
+  H200 sphere-from-scratch checkpoints.
+- ☐ Add a step-0 element-wise assertion in
+  `gear_sonic/scripts/dump_isaaclab_step0.py` that catches this class
+  of bug in O(1) before any rollout starts.
+
+See also `docs/source/user_guide/sim2sim_ablation_study.md` §6 for the
+paper-style write-up of this finding (Phase 6 — root cause).
+
 ## Debugging Recipe: When IsaacLab Works but MuJoCo Doesn't
 
 1. **Dump the IsaacLab step-0 ground truth** with
@@ -843,7 +949,8 @@ files" decision (actuator regime, friction model, motor layout, …).
 | Robot tries to stand on its head | Quaternion sign convention or `quat_rotate_inverse` direction (G2) |
 | Arms float, legs over-respond | Single global action-scale instead of per-joint (G4) |
 | Walks fine for ~1 s then drifts | Tokenizer obs body-frame transform off (G9); motion phase clock not aligned with RSI frame (G10) |
-| Same checkpoint walks in IsaacLab, fails in MuJoCo | Always start with the dump-and-compare recipe above. If proprio/tokenizer/encoder/decoder all match within tolerance, the residual is **foot collider geometry** (G18) — confirm by overriding the IsaacLab eval with `++robot.foot=sphere` and checking that the failure now reproduces inside Isaac. |
+| **Robot turns ~180° within 1–2 s and walks the wrong way** | **6D rotation flatten ordering in `motion_anchor_ori_b_mf_nonflat` does not match training (G9 / G20)** — column-major `concatenate([col0, col1])` instead of row-major `mat[:, :2].reshape(-1)` will permute the channels and produce exactly this symptom. Verified empirically: pre-fix yaw drift hit 180° in 2 s; post-fix it stays under 10°. |
+| Same checkpoint walks in IsaacLab, fails in MuJoCo | Always start with the dump-and-compare recipe above. If proprio/tokenizer/encoder/decoder all match within tolerance, the residual is **foot collider geometry** (G18) — confirm by overriding the IsaacLab eval with `++robot.foot=sphere` and checking that the failure now reproduces inside Isaac. **Note (2026-05-01): G20 retracts the "G18 is the dominant gap" claim** — the dominant MuJoCo failure was the 6D rotation channel-order bug, not foot geometry. |
 | Robot stumbles on heel/toe contact, can't recover | Ankle PD authority — try `--kp-scale-ankle 1.5` (G16b, +0.5 s avg survival on 6k) or `--kp-scale 1.3` (broadband, equivalent gain); foot contact model gap (G11 / G13 — both tried, both negative); confirm armature is set per joint (G12) |
 | Joints feel sluggish at ankle/wrist or over-driven at hip | MJCF armature uniform / mismatched vs Isaac per-joint values (G12) |
 | Walking falls in 2–3 s while standing/squat motions hold | **Not** a deployment-PD problem — G17 swept waist KP (×3, ×5) and knee KP/KD on walks and every config either tied or regressed against baseline. Walking gait is bottlenecked by training data / joint-dynamics DR coverage, not deployed gains. Visual "waist looks weak / knee looks stiff" reflects the policy's *learned* coordination, not a missing torque budget |
@@ -854,15 +961,19 @@ Documented for future contributors picking up this thread. None of the
 items below are blocking deployment, but they are the most likely
 remaining sources of the residual gap visible after applying G1–G12.
 
-1. **Foot contact regime mismatch (see G11, G13, and now G18 — confirmed
-   dominant).** PhysX rigid-mesh + patch-friction during training vs
-   MuJoCo discrete-sphere `condim=3` at deployment. **G18 closed the
-   diagnostic loop:** mirroring the 24-sphere foot collider into IsaacLab
-   reproduces the MuJoCo collapse (0.41 / 0.66 / 0.49 progress on
-   2k/6k/16k vs 1.0 / 1.0 / 1.0 with the stock mesh foot), while none
-   of the other axes (frictionloss, explicit PD, ankle ×1.5) move
-   IsaacLab off 100 % when applied alone. The only remaining
-   intervention is on the **training side**:
+1. **Foot contact regime mismatch (see G11, G13, G18 — and now G20 for
+   the retraction).** PhysX rigid-mesh + patch-friction during training
+   vs MuJoCo discrete-sphere `condim=3` at deployment. G18 *did* close
+   a diagnostic loop showing that mirroring the 24-sphere foot collider
+   into IsaacLab reproduces a similar Isaac-side collapse (0.41 / 0.66
+   / 0.49 progress on 2k/6k/16k vs 1.0 / 1.0 / 1.0 with the stock
+   mesh foot), but **G20 (2026-05-01) shows the dramatic *MuJoCo-side*
+   failure was driven by an unrelated 6D rotation channel-order bug in
+   the deploy script, not by the foot collider.** Training-side
+   sphere-feet remains the right URDF coherence fix and is still being
+   pursued (the H200 from-scratch sphere-feet run started 2026-05-01),
+   but the prior "this is the dominant gap" claim no longer holds.
+   The remaining intervention list is unchanged:
    - *Primary*: train (or fine-tune) on `x2_ultra_sphere_feet.urdf` so
      the policy sees the deployment-time contact regime during learning.
    - *Alternative*: episode-reset randomization between mesh-foot and

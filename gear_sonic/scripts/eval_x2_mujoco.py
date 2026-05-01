@@ -559,7 +559,18 @@ def build_tokenizer_obs(motion_data, current_time, base_quat_wxyz, motion_fps):
         future_rot = Rot.from_quat(fq)
         relative = cur_rot.inv() * future_rot
         rot_mat = relative.as_matrix()
-        ori_6d = np.concatenate([rot_mat[:, 0], rot_mat[:, 1]]).astype(np.float32)
+        # 6D rotation representation MUST match IsaacLab's
+        # ``commands.py::root_rot_dif_l_multi_future``:
+        #   mat[..., :2].reshape(-1)
+        # which flattens the (3, 2) slice in **row-major** order:
+        #   [m00, m01, m10, m11, m20, m21]
+        # An earlier version used ``concatenate([col0, col1])`` which produces
+        # column-major [m00, m10, m20, m01, m11, m21] — same numbers, scrambled
+        # order. That permutation made the policy see a fictitious large yaw
+        # error at every step and "correct" by spinning the robot ~180° within
+        # 1-2 seconds (visible in /tmp/h200_iter761_traj/{relaxed,walkforward}.csv
+        # — relaxed_walk drifted +175° in 2s before this fix).
+        ori_6d = rot_mat[:, :2].reshape(-1).astype(np.float32)
         ori_frames.append(ori_6d)
 
     # Replicate IsaacLab's layout: cat([all_jpos_flat, all_jvel_flat]).reshape(10, 62)

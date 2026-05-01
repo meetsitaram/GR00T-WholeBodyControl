@@ -1,10 +1,27 @@
 # Sim-to-Sim Ablation Study — IsaacLab → MuJoCo for the Agibot X2 Ultra
 
-> **Status:** Draft v1, 2026-04-28. Companion to
+> **Status:** Draft v2, 2026-05-01. Companion to
 > [`sim2sim_mujoco.md`](sim2sim_mujoco.md). The latter is an
 > engineering-debugging guide; this document is a self-contained
 > experimental write-up suitable for an external audience or a paper
 > appendix.
+>
+> **⚠️ 2026-05-01 update — root cause discovered.** The dominant
+> failure mode in this study ("MuJoCo policy collapses in 2–5 s, robot
+> turns 180° within 1–2 s and walks the wrong way") was **NOT** a
+> sim-to-sim physics gap. It was a 6D-rotation channel-order bug in the
+> deploy-side observation builder
+> (`gear_sonic/scripts/eval_x2_mujoco.py::build_tokenizer_obs`):
+> training flattens the 6D matrix in **row-major** order
+> (`[m00, m01, m10, m11, m20, m21]`) while the MuJoCo eval was
+> concatenating the **first two columns** (`[m00, m10, m20, m01, m11,
+> m21]`) — same six numbers, scrambled positions, channels 1↔2 / 3↔4
+> swapped. Every Phase 1–4 MuJoCo number in this document was measured
+> under that bug. The fix is a one-line edit and is documented in
+> [§6 below](#6-phase-6--deploy-side-6d-rotation-channel-order-bug-root-cause).
+> URDF coherence (sphere-feet) is still a real and worthwhile fix, but
+> it is **not** the primary sim-to-sim driver this study originally
+> claimed.
 
 ## TL;DR
 
@@ -511,6 +528,165 @@ candidate, ~10 minutes per candidate).
 
 ---
 
+## 6. Phase 6 — Deploy-side 6D rotation channel-order bug (root cause)
+
+> **2026-05-01.** While evaluating an early checkpoint
+> (iter 761 / 25 000) of the new from-scratch sphere-feet H200 run, the
+> bug that drives every "MuJoCo collapse in 2–5 s" failure mode in this
+> study was finally pinned down. It is **not** sim-to-sim physics.
+
+### 6.1 What the bug is
+
+`build_tokenizer_obs` in
+[`gear_sonic/scripts/eval_x2_mujoco.py`](../../gear_sonic/scripts/eval_x2_mujoco.py)
+constructs the `motion_anchor_ori_b_mf_nonflat` channel — the 6D
+representation of the relative rotation between the robot's current
+orientation and each of the 10 future reference frames. The
+training-side reference is
+[`commands.py::root_rot_dif_l_multi_future`](../../gear_sonic/envs/manager_env/mdp/commands.py),
+which flattens the first two columns of the 3×3 matrix in **row-major**
+order:
+
+```python
+mat = matrix_from_quat(root_rot_dif)         # (..., 3, 3)
+out = mat[..., :2].reshape(num_envs, -1)     # row-major → [m00, m01, m10, m11, m20, m21]
+```
+
+The MuJoCo eval was instead concatenating the first two **columns**:
+
+```python
+rot_mat = relative.as_matrix()                                 # (3, 3)
+ori_6d = np.concatenate([rot_mat[:, 0], rot_mat[:, 1]])         # column-major → [m00, m10, m20, m01, m11, m21]
+```
+
+The six numbers are identical, but their positions in the 6-vector are
+scrambled: positions 1↔2 and 3↔4 are swapped. The policy was trained
+to read the channels in one order and was being fed them in another, in
+every single MuJoCo rollout this study reports.
+
+### 6.2 How it was caught
+
+Direct trajectory logging (new `--traj-csv` flag on
+`record_x2_eval_mujoco.py`, see Appendix A.4) on the iter-761
+sphere-trained checkpoint, three motions × 20 s headless:
+
+| motion | max\|robot − ref yaw\| in 0–5 s | robot travel direction (0–5 s) | ref travel direction |
+|---|---:|---:|---:|
+| `relaxed_walk_postfix` | **179.9°** | **+57.5°** (NE, 1.0 m) | −87.6° (S, 3.1 m) |
+| `walk_forward`         | 134.7°    | −92.6° (1.0 m)         | −97.1° (0.78 m)   |
+| `take_a_sip`           | 11.0°     | (stationary)           | (stationary)      |
+
+The standing motion (`take_a_sip`) exhibits zero pirouette because the
+policy never tries to translate. The two walking motions both flip
+~140–180° of heading within 2 s, exactly matching the long-standing
+qualitative "robot turns back and walks the other way" complaint
+across every prior MuJoCo viewer session. That symptom-to-cause map
+is impossible to explain with any contact-side physics gap (no contact
+delta can rotate the body 180° while leaving foot height unchanged) —
+the robot was actively *commanding* the turn because the heading
+observation was a permutation of the trained one.
+
+### 6.3 The fix
+
+One line in `build_tokenizer_obs`:
+
+```python
+# Before (column-major concat):
+ori_6d = np.concatenate([rot_mat[:, 0], rot_mat[:, 1]]).astype(np.float32)
+# After (row-major flatten — matches commands.py::root_rot_dif_l_multi_future):
+ori_6d = rot_mat[:, :2].reshape(-1).astype(np.float32)
+```
+
+Re-running the same iter-761 checkpoint, same motions, same physics:
+
+| motion       | BEFORE fix      | AFTER fix         | yaw drift (0–5 s) |
+|---|---:|---:|---:|
+| `relaxed_walk_postfix` | fell @ 13.9 s | **survived 20 s**, travelled **2.6 m of 3.1 m expected (84 %)** | 8.8° (was 179.9°) |
+| `take_a_sip`           | fell @ 8.4 s  | **survived 20 s**                                                | 5.0° |
+| `walk_forward`         | fell @ 1.0 s  | fell @ 1.4 s (still bad, but heading drift now 18.7° not 134.7° — failure mode is now genuine balance, not heading) | 18.7° |
+
+The script
+[`gear_sonic/scripts/eval_x2_mujoco_onnx.py`](../../gear_sonic/scripts/eval_x2_mujoco_onnx.py)
+imports `build_tokenizer_obs` directly so it inherits the fix. Both
+versions of the script (interactive viewer + headless recorder) are
+fixed by a single change.
+
+### 6.4 Implications for the Phase 1–5 conclusions
+
+What still holds:
+
+- **URDF coherence is still a real win.** AgiBot's MJCF ships with
+  12-sphere feet; we were training with mesh feet. Replacing the
+  IsaacLab URDF with `x2_ultra_sphere_feet.urdf` so the policy sees
+  the deploy-time foot collider is a clean, principled fix. Phase 2's
+  observation that swapping the URDF mid-IsaacLab-eval drops success
+  from 1.0 to 0.49 is real and reproducible — it just measures
+  *Isaac-side* sensitivity, which is unrelated to the heading bug.
+- **The five-axis ablation chassis** (`sweep_isaac_mujoco_mirror.py`,
+  rows A0–A5) is a sound methodology for Isaac-side stress tests.
+- **Sphere-feet training from scratch** on the 2 550-motion dataset
+  (the H200 run launched 2026-05-01) is still the right thing to do:
+  even with the heading bug fixed, training on the deploy URDF
+  removes one source of distribution shift.
+
+What needs to be re-measured under the fix:
+
+- **Every MuJoCo time-to-fall number in §3 (Phases 1–3).** The 2–5 s
+  collapse times were the *bug* speaking, not the physics. The
+  iter-761 sphere-trained checkpoint (3 % of training) already
+  survives 20 s on `relaxed_walk` post-fix, and that is *worse*
+  hardware than the 16 k mesh-trained policy on which the original
+  numbers were collected. Likely the 16 k mesh policy with the fixed
+  eval will look qualitatively different from the §3 results.
+- **The "dominant axis" claim in the TL;DR.** Phase 1 attributed the
+  full sim2sim gap to the foot collision model because that was the
+  single Isaac-side knob that reproduced the MuJoCo failure inside
+  Isaac. That correlation is genuine for Isaac-side robustness, but
+  the *MuJoCo-side* failure was driven by the channel-order bug, not
+  by the foot collider. The two effects were coincidentally aligned
+  in time but causally separate.
+- **Phase 5 (MJCF audit).** Most of the candidate knobs (`solref`,
+  `condim`, friction tuple, ankle armature) become much lower-priority
+  now that the main MuJoCo failure mode is gone. Worth keeping as a
+  small bench against the post-fix baseline rather than a primary
+  axis.
+
+What this study still records correctly, and is worth preserving:
+
+- The provenance bug in §1.4 (training URDF mismatch) is unrelated to
+  the heading bug and is its own genuine fix.
+- The Phase 4 qualitative MuJoCo viewer observations (heel/toe
+  stumbling on specific motions) are now *unexplained* once heading is
+  removed — the residual MuJoCo failures may turn out to be a smaller,
+  cleaner physics gap than this study assumed.
+
+### 6.5 Action items
+
+1. ✅ **Fix landed** in
+   [`build_tokenizer_obs`](../../gear_sonic/scripts/eval_x2_mujoco.py) —
+   visually verified on `relaxed_walk` (no more pirouette; tracking
+   stable for full 30 s viewer episode).
+2. ☐ **Re-run the multi-init MuJoCo bench** (Appendix A.2) on the
+   16 k mesh-trained, 4 k sphere-fine-tune, and current H200 sphere
+   checkpoints under the fix to get a clean post-fix baseline.
+3. ☐ **Re-run the IsaacLab ablation sweep** (Appendix A.1) with the
+   iter-761 H200 checkpoint to confirm Isaac-side numbers are
+   unaffected (they should be — this is purely a deploy-side bug).
+4. ☐ Audit other deploy paths
+   ([`eval_x2_mujoco_onnx.py`](../../gear_sonic/scripts/eval_x2_mujoco_onnx.py),
+   the real-robot deploy stack) for the same channel-order assumption.
+   The ONNX path imports `build_tokenizer_obs` directly so it is
+   already correct, but the C++ / on-device deploy code should be
+   spot-checked.
+5. ☐ Add a step-0 obs assertion in
+   [`gear_sonic/scripts/dump_isaaclab_step0.py`](../../gear_sonic/scripts/dump_isaaclab_step0.py)
+   that compares the `motion_anchor_ori_b_mf_nonflat` element-by-element
+   between Isaac and the MuJoCo builder. This bug would have been
+   caught immediately by such an assertion at step 0 (off by a
+   permutation, not by tolerance).
+
+---
+
 ## Appendix A — Reproduction commands
 
 ### A.1 Run the IsaacLab ablation sweep
@@ -561,6 +737,26 @@ bash gear_sonic/scripts/cloud/run_smoke_8gpu.sh
 
 (Despite the script name, with `NUM_PROCESSES=1` it runs single-GPU
 fine.)
+
+### A.4 Per-step trajectory CSV (used to diagnose §6 heading bug)
+
+```bash
+conda run -n env_isaaclab --no-capture-output python \
+    gear_sonic/scripts/record_x2_eval_mujoco.py \
+    --checkpoint $CKPT \
+    --motion    $MOTION \
+    --init-frame 0 \
+    --duration 20.0 \
+    --no-render \
+    --traj-csv /tmp/traj.csv \
+    --out      /tmp/_unused.mp4
+```
+
+The CSV has one row per control step with columns
+`step, t, robot_{x,y,z,yaw_deg}, ref_{x,y,z,yaw_deg}, ref_motion_frame,
+pelvis_z, robot_lin_vel_{x,y}_w`. Plotting `robot_yaw_deg − ref_yaw_deg`
+vs `t` was the diagnostic that pinned down the §6 6D rotation
+channel-order bug.
 
 ---
 
