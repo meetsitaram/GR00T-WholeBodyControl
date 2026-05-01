@@ -684,6 +684,25 @@ What still holds:
   observation that swapping the URDF mid-IsaacLab-eval drops success
   from 1.0 to 0.49 is real and reproducible — it just measures
   *Isaac-side* sensitivity, which is unrelated to the heading bug.
+
+  Once the heading bug is removed, the value of the sphere-feet
+  fine-tune is also visible *MuJoCo-side*. Same motion (icecream —
+  pure standing-with-arms, no locomotion), same RSI init, both
+  rollouts post-G20. Left: the original `16k_mesh_baseline` loses
+  balance in 3.6 s. Right: a 4k-iter fine-tune of that same policy
+  on `x2_ultra_sphere_feet.urdf` stands and tracks the eating
+  gesture for the full 15 s clip. The only difference between the
+  two checkpoints is what foot URDF they were trained against:
+
+  ![Same standing motion (icecream), 16k mesh-trained vs 4k sphere fine-tune, both post-fix](../_static/sim2sim_demo/postfix_icecream__16k_vs_4k_sphere_ft.gif)
+
+  **This is what motivated the H200 from-scratch sphere-feet run
+  launched 2026-05-01:** if 4k iters of fine-tuning on the right
+  URDF already saturates the bench cap on standing motions, a 25k
+  iter from-scratch run on the same URDF has plenty of headroom to
+  genuinely solve the full motion suite — including the harder
+  walking motions where the fine-tune still has residual gait
+  artefacts.
 - **The five-axis ablation chassis** (`sweep_isaac_mujoco_mirror.py`,
   rows A0–A5) is a sound methodology for Isaac-side stress tests.
 - **Sphere-feet training from scratch** on the 2 550-motion dataset
