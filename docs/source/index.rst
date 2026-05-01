@@ -102,7 +102,6 @@ Documentation
    user_guide/new_embodiments
    user_guide/sim2sim_mujoco
    user_guide/sim2sim_ablation_study
-   user_guide/x2_sonic_diagnostic
    user_guide/train-on-cloud
    user_guide/training_runs
    user_guide/compute_scaling_sonic_vs_ours

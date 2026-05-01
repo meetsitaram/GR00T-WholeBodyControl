@@ -135,6 +135,49 @@ collision-geom diff between the URDF you select for IsaacLab and the
 MJCF you select for MuJoCo. Mismatches surface as visually-plausible
 but functionally divergent contact behaviour.
 
+#### Cross-reference: AgiBot's `agibot_x1_train` recipe
+
+While diagnosing the URDF-mismatch hypothesis we cloned
+[`AgibotTech/agibot_x1_train`](https://github.com/AgibotTech/agibot_x1_train)
+(the public X1 humanoid-gym training recipe) and did a file-by-file
+comparison. Findings:
+
+- **Asset side** — our hand-authored `x2_ultra_sphere_feet.urdf` is
+  byte-equivalent to AgiBot's `x2_ultra_simple_collision.urdf` (same
+  12-sphere foot, same kinematic tree, same inertials). The two paths
+  converge: we did not need to migrate to upstream files.
+- **Training-recipe side** — X1 ships ~414 lines of carefully hand-tuned
+  PD, observation noise, latency randomisation, joint-armature/coulomb-
+  friction DR, and regularisation rewards (`humanoid/envs/x1/x1_dh_stand_config.py`).
+  We reviewed every block:
+  - X1's hand-tuned per-joint PD (Hip KP=30-40, Knee=100, Ankle=35,
+    `action_scale=0.5`) was not adopted — our `armature × ω²`
+    formula table is self-consistent and the G16b/G17 sweeps in
+    [`sim2sim_mujoco.md`](sim2sim_mujoco.md) already showed that
+    further hand-tuning either ties or regresses on walking motions.
+  - X1's wide DR ranges (action lag 5-40 ms, joint armature 500×,
+    torque multiplier ±20%) and X1's `dof_vel ~2.25 rad/s`
+    observation noise were *not* adopted because the dominant
+    sim2sim symptom they were meant to robustify against turned out
+    to be the deploy-side 6D rotation channel-order bug (§6 / G20),
+    not a real distribution shift. The recipe should be revisited
+    for sim-to-real once we have a clean post-§6-fix MuJoCo
+    baseline.
+  - X1's regularisation rewards (`action_smoothness`, `dof_acc`,
+    torque magnitude) are a reasonable addition for any future
+    embodiment but were not the sim2sim driver in our case.
+
+The high-level architectural distinction is worth recording: X1 takes
+a **simple-MJCF + wide-DR** approach (just `damping=1` per joint, no
+armature, no frictionloss; sophistication lives in the training-side
+randomisations). We took the **rich-MJCF + measured params** approach
+(per-joint armature classes, frictionloss, sphere-foot collision
+geometry; less DR). Both are valid; the rich-MJCF path requires the
+system identification to be correct, which the placeholder armature
+values in `x2_ultra.py:11` partly violate. Migration to a wide-DR
+training recipe remains a credible Plan B if the post-§6 baseline
+shows a residual gap.
+
 ---
 
 ## 2. Ablation framework
