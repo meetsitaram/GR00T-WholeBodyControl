@@ -220,6 +220,10 @@ sonic_release/
 # Agibot X2 (local reference material & notes; not tracked for now)
 agibot-x2-references/
 
+# Personal local dev notes (not tracked)
+vastai-dev-notes.md
+*-dev-notes.md
+
 # X2 deploy: per-run robot logs (binary obs dumps, tick.csv, target_pos.csv,
 # joint_pos.csv etc). Generated under logs/x2/<runtag>/ by deploy_x2.sh and
 # the offline parity tools. They're large (tens of MB per run), regenerated
