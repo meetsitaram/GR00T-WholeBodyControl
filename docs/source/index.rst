@@ -104,6 +104,9 @@ Documentation
    user_guide/sim2sim_ablation_study
    user_guide/train-on-cloud
    user_guide/training_runs
+   user_guide/compute_scaling_sonic_vs_ours
+   user_guide/gpu_cost_comparison
+   user_guide/ppo_batch_size_explainer
 
 .. toctree::
    :maxdepth: 2
