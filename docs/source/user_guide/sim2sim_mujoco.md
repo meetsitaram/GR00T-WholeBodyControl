@@ -929,19 +929,154 @@ fixed-layout channel like a flattened rotation matrix.
 
 **Followups.**
 
-- ☐ Audit the C++ / on-device deploy stack
-  (`gear_sonic/scripts/eval_x2_mujoco_onnx.py` is fine — it imports
-  `build_tokenizer_obs` directly) for the same column-vs-row-major
-  assumption.
-- ☐ Re-run the multi-init MuJoCo bench under the fix to get clean
-  post-fix baselines for the 16 k mesh, 4 k sphere fine-tune, and
-  H200 sphere-from-scratch checkpoints.
+- ✅ ~~Audit the C++ / on-device deploy stack for the same
+  column-vs-row-major assumption.~~ Done — the C++ deploy
+  (`gear_sonic_deploy/.../tokenizer_obs.hpp`) was already correct.
+  But auditing the ONNX evaluation path for tokenizer-layout
+  assumptions surfaced a *separate* bug — see G21 below.
+- ✅ ~~Re-run the multi-init MuJoCo bench under the fix.~~ Done —
+  see `sim2sim_ablation_study.md` §6.6 (PT) and §6.7 (ONNX).
 - ☐ Add a step-0 element-wise assertion in
   `gear_sonic/scripts/dump_isaaclab_step0.py` that catches this class
   of bug in O(1) before any rollout starts.
 
 See also `docs/source/user_guide/sim2sim_ablation_study.md` §6 for the
 paper-style write-up of this finding (Phase 6 — root cause).
+
+### G21. ONNX-side tokenizer layout bug — `OnnxActor` was scrambling deploy obs
+
+**Date discovered:** 2026-05-01, immediately after the G20 fix and a
+fresh iter-2000 dump regen.
+
+**One-line summary.** The fused g1 ONNX expects the 680-D tokenizer
+slice in **per-frame interleaved** layout (same as
+`build_tokenizer_obs` and the IsaacLab live module produce natively).
+A wrapper helper `_interleaved_to_grouped` in
+`gear_sonic/scripts/eval_x2_mujoco_onnx.py::OnnxActor.__call__` was
+re-shuffling that interleaved input into a "grouped" layout
+`[cmd_flat(620) | ori_flat(60)]` before feeding the ONNX session. That
+re-shuffle was based on a misreading of `UniversalTokenWrapper.forward`
+in `gear_sonic/utils/inference_helpers.py`, and corrupted every ONNX
+rollout.
+
+**Why it was hard to see.** The export-time check in
+`reexport_x2_g1_onnx.py` validates `FusedG1Wrapper` (PyTorch wrapper
+around the live module) against the ONNX session — both are correct,
+they agree to ≈ 5 × 10⁻⁷ rad. The PT-only bench (`eval_x2_mujoco.py` →
+`UniversalTokenActor`) is also correct. So both halves of "PT vs
+ONNX" were individually fine; only the deploy-side wrapper that
+*concatenates* the tokenizer obs and the proprioception into the
+1670-D `actor_obs` had the layout bug, and it sat in a function whose
+docstring confidently asserted the opposite of what the ONNX graph
+expected.
+
+**How it surfaced.**
+
+1. After regenerating the IsaacLab step-0 dump from the live
+   iter-2000 module (G20 follow-up), the `UniversalTokenActor`
+   re-implementation was verified to match the live module to
+   3.6 × 10⁻⁷ rad — so its previous "0.26 rad encoder divergence"
+   was a stale-dump artifact, not a real bug.
+2. Despite that, `eval_x2_mujoco_onnx.py --compare-pt` **still**
+   reported a 3.3 rad max action delta between PT and ONNX over a
+   150-tick rollout, and `walk_forward init=20` deterministically
+   fell at 1.64 s in ONNX while saturating in PT.
+3. Direct candidate-layout test: take the live dump's intermediate
+   tensors, build all 4 candidate input layouts, feed each to ONNX,
+   compare to the live `decoder_action_mean`:
+
+   ```
+   layout                                              max|live - onnx|
+   grouped [cmd_flat(620), ori_flat(60)]               1.455
+   grouped [ori_flat(60), cmd_flat(620)]               1.271
+   interleaved (cat([cmd, ori], axis=-1).flatten())    4.768e-07  ✓
+   interleaved reverse                                 1.022
+   ```
+
+   **Only the per-frame interleaved layout matches.**
+4. Static analysis of the ONNX graph confirms why:
+
+   ```
+   obs (B, 1670)
+     → Slice(start=0, end=680, axis=1)        # tokenizer chunk
+     → Reshape(-1, 10, 68)                    # ← single direct reshape
+     → Reshape(-1, 680)                       # flatten for MLP
+     → Gemm(encoder.module.0)                 # first encoder linear
+   ```
+
+   `torch.onnx.export` constant-folded the wrapper's
+   `slice + reshape + slice + reshape + cat` chain into a single
+   `Reshape(-1, 10, 68)`. That collapse is only correct if the input
+   is **already** in interleaved layout — which is exactly what
+   `build_tokenizer_obs` (and the IsaacLab encoder input) produces
+   natively. The wrapper's `_interleaved_to_grouped` was scrambling
+   correct input into incorrect input.
+
+**Fix.** Removed `_interleaved_to_grouped` from
+`OnnxActor.__call__`. Tokenizer obs is now passed straight through.
+Replaced the lying docstring with a static-analysis-derived note
+documenting that the ONNX expects per-frame interleaved layout and
+that no rearrangement is needed at the deploy boundary. The C++
+deploy header at
+`gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/include/tokenizer_obs.hpp`
+was already correct (interleaved, with a "Bug history" comment
+documenting the same kind of mistake on a previous occasion).
+
+**Validation after the fix.**
+
+| Check | Result | Threshold |
+|---|---|---|
+| `--compare-pt` parity (relaxed_walk init=0, 150 ticks) | **PASS** — 1.7 × 10⁻⁶ rad max | 1 × 10⁻⁴ rad |
+| `walk_forward init=0/20/40/60` ONNX-only rollout | **all 4 saturate 30 s** | (was: init=20 fell at 1.64 s) |
+| Full 60-cell §6.7 ONNX bench vs PT §6.6 | **all sphere-FT/H200 cells saturate; 16 k mesh agrees within 1σ** | qualitative match |
+
+**Lessons.**
+
+- A wrapper that *only* runs in deploy mode (and not at training
+  time) needs the same first-tick element-wise assertion against an
+  IsaacLab dump that G20's followup is asking for. We had two
+  separate "correct on each side, broken at the seam" bugs in a row
+  (G20: the 6D rotation flatten in `build_tokenizer_obs`; G21: the
+  tokenizer rearrangement in `OnnxActor.__call__`). Both would have
+  been caught in O(1) by an element-wise step-0 dump comparison
+  against the live module.
+- Don't trust a wrapper docstring that claims "I tested this and
+  PT/ONNX agree to 1e-7 with my rearrangement applied". The G21
+  docstring did make this claim. The claim was based on running the
+  rearrangement against a *PT-only* test path that didn't actually
+  exercise the ONNX session — i.e. the test passed for the wrong
+  reason. Always validate via the ONNX session, on a known-good
+  IsaacLab dump.
+- `torch.onnx.export` aggressively folds slice+reshape+concat chains.
+  If the original PyTorch wrapper depended on the input being in a
+  non-trivial layout, the exported graph's input expectations may
+  differ from the wrapper's by a permutation. Always re-validate
+  ONNX inputs against a fresh dump after every re-export.
+
+**Followups.**
+
+- ☐ Add a deploy-side step-0 element-wise assertion that compares
+  the 1670-D `actor_obs` you're about to feed the ONNX session
+  against an IsaacLab dump's `tokenizer_flat | proprioception_input`
+  vector, position-by-position. Same prescription as G20's
+  followup, just on the ONNX-input side of the wrapper.
+- ☐ Optional: rewrite `UniversalTokenWrapper.forward` (the export
+  scaffold in `gear_sonic/utils/inference_helpers.py`) to take
+  inputs in the same per-frame interleaved layout that
+  `build_tokenizer_obs` and IsaacLab's live encoder emit, so that
+  the export-traced graph's input layout matches "the layout
+  IsaacLab actually uses" by construction, not by accidental
+  constant-folding.
+- ☐ Re-export the `last/` symlinks for older runs
+  (`run-20260420_083925/exported/`) so the cached fused ONNX files
+  are also under the post-G21 export path. The Apr-21 cached
+  artifacts in that folder fail their own `--compare-pt` parity
+  check at ~4 rad — they shipped before G20 and are not safe to
+  deploy.
+
+See `sim2sim_ablation_study.md` §6.7 for the §6.6-equivalent bench
+re-run under the post-G21 ONNX path; the deploy artifact matches the
+PT bench within stochastic noise on every cell.
 
 ## Debugging Recipe: When IsaacLab Works but MuJoCo Doesn't
 
@@ -973,6 +1108,7 @@ paper-style write-up of this finding (Phase 6 — root cause).
 | Arms float, legs over-respond | Single global action-scale instead of per-joint (G4) |
 | Walks fine for ~1 s then drifts | Tokenizer obs body-frame transform off (G9); motion phase clock not aligned with RSI frame (G10) |
 | **Robot turns ~180° within 1–2 s and walks the wrong way** | **6D rotation flatten ordering in `motion_anchor_ori_b_mf_nonflat` does not match training (G9 / G20)** — column-major `concatenate([col0, col1])` instead of row-major `mat[:, :2].reshape(-1)` will permute the channels and produce exactly this symptom. Verified empirically: pre-fix yaw drift hit 180° in 2 s; post-fix it stays under 10°. |
+| **PyTorch eval works, ONNX eval falls deterministically on the same RSI cell** | **Tokenizer-layout bug at the ONNX wrapper boundary (G21).** `eval_x2_mujoco_onnx.py::OnnxActor` was applying a spurious "interleaved → grouped" rearrangement on the 680-D tokenizer slice before feeding the ONNX session. Pre-fix `--compare-pt` reports 3+ rad action delta over a rollout while PT alone is faithful. Fix: remove the rearrangement; the fused g1 ONNX expects per-frame interleaved layout — same as `build_tokenizer_obs` already produces. |
 | Same checkpoint walks in IsaacLab, fails in MuJoCo | Always start with the dump-and-compare recipe above. If proprio/tokenizer/encoder/decoder all match within tolerance, the residual is **foot collider geometry** (G18) — confirm by overriding the IsaacLab eval with `++robot.foot=sphere` and checking that the failure now reproduces inside Isaac. **Note (2026-05-01): G20 retracts the "G18 is the dominant gap" claim** — the dominant MuJoCo failure was the 6D rotation channel-order bug, not foot geometry. |
 | Robot stumbles on heel/toe contact, can't recover | Ankle PD authority — try `--kp-scale-ankle 1.5` (G16b, +0.5 s avg survival on 6k) or `--kp-scale 1.3` (broadband, equivalent gain); foot contact model gap (G11 / G13 — both tried, both negative); confirm armature is set per joint (G12) |
 | Joints feel sluggish at ankle/wrist or over-driven at hip | MJCF armature uniform / mismatched vs Isaac per-joint values (G12) |

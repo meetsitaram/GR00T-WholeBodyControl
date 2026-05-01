@@ -5,6 +5,28 @@ Loads a .pt checkpoint, reconstructs the universal-token actor (g1 encoder
 + g1_dyn decoder), reads the motion-lib PKL for reference commands, and
 runs a PD-control loop in MuJoCo with on-screen rendering.
 
+✅ PARITY VERIFIED — 2026-05-01 (iter-2000 sphere-feet checkpoint)
+   The :class:`UniversalTokenActor` reimplementation below (SimpleMLP
+   encoder + decoder + hand-rolled FSQ) matches the live
+   ``UniversalTokenModule`` to float32 precision when fed identical
+   inputs. Stage-by-stage check against a fresh
+   ``dump_isaaclab_step0`` dump from the live IsaacLab module:
+
+     - encoder latent: max|diff| = 2.4e-7
+     - FSQ output:     max|diff| = 0  (exact)
+     - final action:   max|diff| = 3.6e-7  rad
+
+   So this script is a faithful PyTorch evaluator of the deployed
+   policy — its bench numbers reflect the actual deployed actor, not
+   a divergent re-implementation.
+
+   Note (history): an earlier version of this docstring claimed a
+   ~1.3 rad divergence. That conclusion was an artifact of a STALE
+   diagnostic dump (from a different, older 16k-mesh checkpoint) being
+   compared against weights from a newer checkpoint. Always regenerate
+   the dump from the same .pt checkpoint you are evaluating — see
+   ``gear_sonic/scripts/dump_isaaclab_step0.py``.
+
 The robot is reset to the motion's frame-``--init-frame`` state using
 Reference State Initialization (RSI) — the same teleport-into-the-motion
 trick that IsaacLab does at every episode reset. RSI sets joint pos+vel
@@ -282,6 +304,11 @@ def fsq_quantize(z, levels=32):
 class UniversalTokenActor(nn.Module):
     """Reproduces gear_sonic.trl.modules.universal_token_modules.UniversalTokenModule
     inference path for a single g1 encoder + g1_dyn decoder + FSQ quantizer.
+
+    ✅ Verified to match the live UniversalTokenModule to ~3.6e-7 rad on the
+    iter-2000 sphere-feet checkpoint (see module docstring). Validated by
+    ``gear_sonic/scripts/dump_isaaclab_step0.py`` + a stage-by-stage
+    encoder/FSQ/decoder bisection.
 
     Pipeline (matches universal_token_modules.encode + decode for g1/g1_dyn):
         tokenizer_obs(680) ── encoder MLP ──► 64

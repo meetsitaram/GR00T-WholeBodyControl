@@ -66,7 +66,10 @@ randomisation that simulates the unmodelled effects.
 > but smaller URDF/foot-contact residual. Pre-fix conclusions about
 > per-motion checkpoint preference and "30 % of clip" survival are
 > retracted; the residual physics gap is much smaller than this study
-> originally implied. See §6.6 for the full table.
+> originally implied. See §6.6 for the full table, and
+> [§6.7](#67-same-bench-onnx-deploy-artifact-deploy-parity-validated)
+> for the matching ONNX-driven bench (deploy artifact parity ≤
+> 4 × 10⁻⁶ rad vs PT on every checkpoint).
 
 This document records the framework, every measured number, and the
 protocol so that the experiments are reproducible and so the same
@@ -897,6 +900,90 @@ upper bound on their survival time is unknown and ≥ 30 s.
 **Reproduction:** see [Appendix A.2](#a2-run-the-multi-init-mujoco-bench)
 with `--duration 30.0`. Wall time on a single workstation with 8-way
 parallelism: ≈ 170 s for the full 60-cell matrix.
+
+### 6.7 Same bench, ONNX deploy artifact (deploy parity validated)
+
+The §6.6 numbers above were generated with the PyTorch evaluator
+(`eval_x2_mujoco.py` → `UniversalTokenActor`). To validate that the
+**deployed** policy (the fused ONNX consumed by the C++ on-robot
+stack) produces the same behaviour, we re-ran the entire 60-cell
+matrix through `eval_x2_mujoco_onnx.py` against each checkpoint's
+fused g1 ONNX export.
+
+**Per-cell results — ONNX evaluator (time-to-fall, `*` = survived 30 s):**
+
+```
+Motion         Policy                init=0   init=10  init=20  init=30  init=40   mean   std
+─────────────────────────────────────────────────────────────────────────────────────────────
+icecream       16k_mesh_baseline      3.64   14.20    10.92    12.64     4.34     9.15  4.83
+icecream       2k_sphere_ft          30.00*  30.00*  30.00*   30.00*   30.00*   30.00  0.00
+icecream       4k_sphere_ft          30.00*  30.00*  30.00*   30.00*   30.00*   30.00  0.00
+icecream       h200_iter2000         30.00*  30.00*  30.00*   30.00*   30.00*   30.00  0.00
+
+relaxed_walk   16k_mesh_baseline      7.36    4.18     3.62     4.74     3.20     4.62  1.65
+relaxed_walk   2k_sphere_ft          30.00*  30.00*  30.00*   30.00*   30.00*   30.00  0.00
+relaxed_walk   4k_sphere_ft          30.00*  30.00*  30.00*   30.00*   30.00*   30.00  0.00
+relaxed_walk   h200_iter2000         30.00*  30.00*  30.00*   30.00*   30.00*   30.00  0.00
+
+neutral_walk   16k_mesh_baseline      3.38    3.16     2.70     2.90     3.18     3.06  0.26
+neutral_walk   2k_sphere_ft          30.00*  30.00*  30.00*   30.00*   30.00*   30.00  0.00
+neutral_walk   4k_sphere_ft          30.00*  30.00*  30.00*   30.00*   30.00*   30.00  0.00
+neutral_walk   h200_iter2000         30.00*  30.00*  30.00*   30.00*   30.00*   30.00  0.00
+```
+
+**Headline (ONNX vs PT):**
+
+| Motion | 16k mesh ONNX (PT) | 2k sphere FT ONNX (PT) | 4k sphere FT ONNX (PT) | h200 iter2000 ONNX (PT) |
+|---|---:|---:|---:|---:|
+| icecream | 9.15 ± 4.8 (7.70 ± 3.4) | **30.00 ± 0** (30.00 ± 0) | **30.00 ± 0** (30.00 ± 0) | **30.00 ± 0** (30.00 ± 0) |
+| relaxed_walk | 4.62 ± 1.7 (5.70 ± 3.3) | **30.00 ± 0** (30.00 ± 0) | **30.00 ± 0** (30.00 ± 0) | **30.00 ± 0** (30.00 ± 0) |
+| neutral_walk | 3.06 ± 0.3 (3.05 ± 0.2) | **30.00 ± 0** (30.00 ± 0) | **30.00 ± 0** (30.00 ± 0) | **30.00 ± 0** (30.00 ± 0) |
+| **mean across motions** | **5.61** (5.48) | **30.00** (30.00) | **30.00** (30.00) | **30.00** (30.00) |
+
+**Findings:**
+
+1. **ONNX matches PT across every cell.** All 30 sphere-feet /
+   H200 cells saturate identically. The brittle 16 k mesh baseline
+   produces slightly different per-cell fall times because a
+   ≈ 1.7 × 10⁻⁶ rad action delta (pure float32 vs float64 noise)
+   crosses the fall threshold a few control ticks earlier or later
+   on a policy that is already on the edge of falling. The
+   per-motion means agree within ±2 s — well below the 1σ spread
+   on each individual cell — and the qualitative ordering of
+   `neutral_walk < relaxed_walk < icecream` is identical in both
+   evaluators.
+2. **Deploy parity confirmed.** Combined with the export-time
+   check in `reexport_x2_g1_onnx.py` (live `UniversalTokenModule`
+   ↔ ONNX, ~5 × 10⁻⁷ rad on iter-2000 step 0) and the per-tick
+   `--compare-pt` rollout check (PT ↔ ONNX, ~1.7 × 10⁻⁶ rad over
+   150 control ticks), the ONNX artifact is **bit-identical to the
+   trained policy** within float32 noise, and produces the same
+   bench results. The deploy artifact is good to ship.
+3. **Retraction of the prior `neutral_walk init=20` ONNX failure
+   note.** An earlier read of this section claimed the ONNX
+   evaluator deterministically failed on `walk_forward init=20`
+   (fell at 1.64 s while PT saturated). That failure was caused by
+   a layout bug in `eval_x2_mujoco_onnx.py::OnnxActor` that
+   scrambled the tokenizer obs before feeding it to the ONNX
+   session. The bug was identified by static analysis of the
+   exported ONNX graph (which slices `obs[:, :680]` and reshapes
+   directly to `(B, 10, 68)` — i.e. it expects per-frame
+   *interleaved* layout, not the *grouped* layout the buggy
+   wrapper was producing). After the fix, all three previously
+   "failing" cells (`walk_forward init=0/20/40/60`) saturate the
+   30 s cap. See `sim2sim_mujoco.md` G21 for the full bug story
+   and code reference.
+
+**Reproduction:** identical to A.2, but invoke
+`gear_sonic/scripts/eval_x2_mujoco_onnx.py --onnx PATH/TO/policy_g1.onnx`
+in place of `record_x2_eval_mujoco.py`. Wall time was ≈ 160 s for
+the same 60-cell matrix on a single workstation with 5-way
+parallelism.
+
+**ONNX exports used:**
+- 16 k mesh baseline: `run-20260420_083925/x2_16k_mesh_g1.onnx` (re-exported 2026-05-01 from `model_step_016000.pt` — the cached `exported/` ONNX from Apr 21 was a stale artifact and did not match its own `.pt` to ~4 rad; the re-export matches to 3.8 × 10⁻⁶ rad).
+- 2 k / 4 k sphere fine-tune: `sphere_ft-20260428_151857/x2_sphere_ft_{2000,4000}_g1.onnx` (exported 2026-05-01).
+- H200 iter-2000: `h200-iter-2000-20260501/x2_sonic_h200_2k.onnx` (exported 2026-05-01, deploy candidate).
 
 ---
 

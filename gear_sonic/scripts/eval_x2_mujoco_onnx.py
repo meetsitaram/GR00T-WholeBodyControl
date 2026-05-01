@@ -35,6 +35,21 @@ This is **Phase 0** of the X2 Ultra ONNX deploy plan
 (``.cursor/plans/x2-ultra-onnx-deploy_9dde7da2.plan.md``): proving that the
 exact ONNX graph the C++ harness will run produces the same actions as the
 .pt does in MuJoCo, *before* we invest in any C++ / ROS 2 work.
+
+``--compare-pt`` parity check (2026-05-01):
+   The .pt actor used in compare mode is :class:`UniversalTokenActor`
+   from :mod:`eval_x2_mujoco`. As of 2026-05-01 this reimplementation
+   has been verified against a fresh ``dump_isaaclab_step0`` dump of
+   the live ``UniversalTokenModule`` and matches it to ~3.6e-7 rad on
+   the iter-2000 sphere-feet checkpoint. Combined with the
+   export-time check in :mod:`reexport_x2_g1_onnx` (live module ↔
+   ONNX, ~5e-7 rad), ``--compare-pt`` is a meaningful end-to-end
+   regression on the deployed policy.
+
+   If ``--compare-pt`` fails for a particular checkpoint, the most
+   likely cause is a checkpoint mismatch between the .pt and .onnx
+   inputs (different runs, different iters). Re-export the ONNX from
+   the .pt with :mod:`reexport_x2_g1_onnx` and re-run the compare.
 """
 
 import argparse
@@ -93,42 +108,31 @@ PROP_DIM = 990
 ACTOR_OBS_DIM = TOK_DIM + PROP_DIM  # 1670
 
 
-def _interleaved_to_grouped(tokenizer_obs_interleaved: np.ndarray) -> np.ndarray:
-    """Rearrange tokenizer obs from PT (interleaved) to ONNX (grouped) layout.
-
-    SUBTLE: the fused g1 ONNX expects the 680-D tokenizer slice to be
-    ``[all_command_flat(620) | all_ori_flat(60)]`` — that's how
-    ``UniversalTokenWrapper`` in ``inference_helpers.py`` slices/reshapes:
-
-        cmd  = obs[:, :620].reshape(B, 1, 10, 62)
-        ori  = obs[:, 620:680].reshape(B, 1, 10, 6)
-        cat([cmd, ori], dim=-1) -> (B, 1, 10, 68)  # then flatten -> 680 -> MLP
-
-    Meanwhile ``eval_x2_mujoco.py``'s ``build_tokenizer_obs`` (and its
-    ``UniversalTokenActor.SimpleMLP``) consumes a per-frame *interleaved*
-    layout ``[cmd_f0(62) | ori_f0(6) | cmd_f1(62) | ori_f1(6) | ...]`` —
-    that's how the trained MLP was actually fed during training (cat along
-    last dim then flatten C-order over (10, 68)).
-
-    Both end up identical *inside the MLP*, but the user-facing surface
-    differs: PT wants interleaved, ONNX wants grouped. Empirically, with the
-    rearrangement applied, PT (.pt) and ONNX agree to ~2.4e-7 — well below
-    the 1e-4 Phase 0 acceptance threshold. Without it, they diverge by
-    ~O(1) immediately.
-
-    If you're hand-building inputs for the C++ deploy harness, **always
-    use the grouped layout**.
-    """
-    if tokenizer_obs_interleaved.shape[-1] != TOK_DIM:
-        raise ValueError(
-            f"Expected tokenizer width {TOK_DIM}, got {tokenizer_obs_interleaved.shape[-1]}"
-        )
-    grid = tokenizer_obs_interleaved.reshape(NUM_FUTURE_FRAMES_TOK, -1)  # (10, 68)
-    cmd_part = grid[:, :COMMAND_DIM_PER_FRAME]  # (10, 62)
-    ori_part = grid[:, COMMAND_DIM_PER_FRAME:]  # (10, 6)
-    return np.concatenate(
-        [cmd_part.reshape(-1), ori_part.reshape(-1)]
-    ).astype(np.float32)
+# NOTE on the tokenizer layout the fused g1 ONNX expects (verified
+# 2026-05-01 by static analysis of the exported graph + parity test
+# against a fresh ``dump_isaaclab_step0`` dump):
+#
+#     The first 680 elements of ``obs`` are reshaped DIRECTLY to
+#     (B, 10, 68) by the ONNX graph (single ``Reshape(-1, 10, 68)`` op
+#     after a ``Slice``), then flattened back to (B, 680) for the
+#     encoder MLP. This means the ONNX expects per-frame *interleaved*
+#     layout::
+#
+#         [cmd_f0(62) | ori_f0(6) | cmd_f1(62) | ori_f1(6) | ... | cmd_f9(62) | ori_f9(6)]
+#
+#     i.e. exactly what ``np.concatenate([cmd(10,62), ori(10,6)],
+#     axis=-1).reshape(-1)`` produces — which is precisely the layout
+#     ``eval_x2_mujoco.build_tokenizer_obs`` (and the live IsaacLab
+#     ``encoder_input_full``) emits. NO REARRANGEMENT is needed at the
+#     ONNX boundary.
+#
+# History (kept for posterity): an earlier version of this file had a
+# ``_interleaved_to_grouped`` rearrangement based on a misreading of
+# ``UniversalTokenWrapper.forward()``. That added rearrangement was
+# the entire source of the "PT vs ONNX 3.3 rad delta" parity failures
+# (e.g. neutral_walk init=20 falling at 1.64 s under ONNX while PT
+# saturated). Removing the rearrangement makes ONNX agree with the
+# live module to ~5e-7 rad on identical inputs.
 
 
 # ---------- ONNX wrapper ----------
@@ -136,10 +140,10 @@ class OnnxActor:
     """Thin wrapper that mimics ``UniversalTokenActor.__call__`` signature.
 
     Accepts ``proprioception (990)`` and ``tokenizer_obs (680)`` numpy arrays
-    (single batch). The ``tokenizer_obs`` is assumed to be in PT-style
-    *interleaved* layout (matches what ``eval_x2_mujoco.build_tokenizer_obs``
-    produces); we rearrange to ONNX-style *grouped* layout before feeding the
-    session — see :func:`_interleaved_to_grouped` for the rationale.
+    (single batch). ``tokenizer_obs`` must be in the per-frame interleaved
+    layout produced by :func:`eval_x2_mujoco.build_tokenizer_obs`; the ONNX
+    graph consumes it directly with no rearrangement. See the module-level
+    note above for the layout rationale.
     """
 
     def __init__(self, onnx_path: str, providers=None):
@@ -166,9 +170,13 @@ class OnnxActor:
             )
 
     def __call__(self, proprioception: np.ndarray, tokenizer_obs: np.ndarray) -> np.ndarray:
-        tok_grouped = _interleaved_to_grouped(tokenizer_obs.astype(np.float32))
-        actor_obs = np.concatenate([tok_grouped, proprioception.astype(np.float32)])
-        actor_obs = actor_obs.reshape(1, -1)
+        if tokenizer_obs.shape[-1] != TOK_DIM:
+            raise ValueError(
+                f"Expected tokenizer width {TOK_DIM}, got {tokenizer_obs.shape[-1]}"
+            )
+        actor_obs = np.concatenate(
+            [tokenizer_obs.astype(np.float32), proprioception.astype(np.float32)]
+        ).reshape(1, -1)
         out = self.session.run([self.output_name], {self.input_name: actor_obs})[0]
         return out[0]  # (31,) IL order
 

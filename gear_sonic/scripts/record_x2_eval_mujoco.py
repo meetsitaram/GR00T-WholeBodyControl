@@ -5,6 +5,14 @@ Same RSI + PD-control loop as ``eval_x2_mujoco.py`` but renders every control
 step with ``mujoco.Renderer`` instead of the interactive viewer, then muxes
 the frames into an MP4 with imageio/ffmpeg.
 
+✅ Faithful PT eval: this script imports :class:`UniversalTokenActor` from
+   :mod:`eval_x2_mujoco`, which has been verified to match the live
+   ``UniversalTokenModule`` to ~3.6e-7 rad on the iter-2000 sphere-feet
+   checkpoint (validated against a fresh
+   ``gear_sonic/scripts/dump_isaaclab_step0.py`` dump). So the rollouts
+   recorded here track the deployed policy faithfully. For ONNX-driven
+   evaluation, use :mod:`eval_x2_mujoco_onnx` instead.
+
 Example:
     conda run -n env_isaaclab --no-capture-output python \\
         gear_sonic/scripts/record_x2_eval_mujoco.py \\
