@@ -969,7 +969,16 @@ class ModularTrackingEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.dt = config.get("sim_dt", 0.005)
         self.sim.render_interval = self.decimation
         self.sim.physics_material = self.scene.terrain.physics_material
-        self.sim.physx.gpu_max_rigid_patch_count = 10 * 2**15
+        # PhysX GPU narrowphase contact patch buffer. The default 10*2**15
+        # (~327K) overflows on contact-rich URDFs (e.g. x2_ultra_sphere_feet
+        # with 24 spheres/foot) above ~12K envs/GPU — see "Patch buffer
+        # overflow" errors in the bones_seed_sphere_feet-20260501 run, which
+        # peaked at ~511K requested. Bumped to 2**20 (~1M) to give 2x
+        # headroom at 24K envs/GPU on B200; cheap GPU memory (~64 MB).
+        # Override via config if you push past 32K envs/GPU.
+        self.sim.physx.gpu_max_rigid_patch_count = config.get(
+            "gpu_max_rigid_patch_count", 2**20
+        )
 
         # Increase collision stack size for scenes with complex collision meshes (e.g. staircases)
         gpu_collision_stack_size_exp = config.get("gpu_collision_stack_size_exp", 26)
