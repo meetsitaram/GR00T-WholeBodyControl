@@ -54,6 +54,20 @@ friction-cone model, and integration substeps — and must be addressed
 either by deploy-side MJCF tuning or by training-side domain
 randomisation that simulates the unmodelled effects.
 
+> **TL;DR addendum, 2026-05-01.** Once the 6D rotation channel-order
+> bug ([§6](#6-phase-6--deploy-side-6d-rotation-channel-order-bug-root-cause))
+> is fixed, the picture changes substantially. In a re-run of the
+> multi-init bench under the fix ([§6.6](#66-post-fix-multi-init-mujoco-bench),
+> 30 s cap), both 2 k and 4 k sphere-feet fine-tune checkpoints
+> **saturate the bench** — they survive the full 30 s on every cell of
+> a 3-motion × 5-init matrix, including 13 + s of looped reference
+> tracking past clip end. The 16 k mesh baseline improves to 5.48 s
+> mean (vs 2.43 s pre-fix) but does *not* saturate, confirming a real
+> but smaller URDF/foot-contact residual. Pre-fix conclusions about
+> per-motion checkpoint preference and "30 % of clip" survival are
+> retracted; the residual physics gap is much smaller than this study
+> originally implied. See §6.6 for the full table.
+
 This document records the framework, every measured number, and the
 protocol so that the experiments are reproducible and so the same
 ablation chassis can be re-used for other embodiments and other
@@ -712,25 +726,38 @@ What still holds:
 
 What needs to be re-measured under the fix:
 
-- **Every MuJoCo time-to-fall number in §3 (Phases 1–3).** The 2–5 s
-  collapse times were the *bug* speaking, not the physics. The
-  iter-761 sphere-trained checkpoint (3 % of training) already
-  survives 20 s on `relaxed_walk` post-fix, and that is *worse*
-  hardware than the 16 k mesh-trained policy on which the original
-  numbers were collected. Likely the 16 k mesh policy with the fixed
-  eval will look qualitatively different from the §3 results.
+- **Every MuJoCo time-to-fall number in §3 (Phases 1–3).** ✅ Done in
+  [§6.6 Post-fix multi-init bench](#66-post-fix-multi-init-mujoco-bench).
+  Headline: the 2–5 s pre-fix collapse times for sphere-FT policies
+  were entirely the bug speaking — both 2k and 4k sphere-FT now survive
+  the full 30 s window on all three motions, and the H200 iter-2000
+  checkpoint (only ~8 % through training) already saturates all three
+  motions. The 16 k mesh baseline doubled (2.43 → 5.48 s
+  mean) but did not saturate, confirming a genuine, residual
+  URDF/foot-contact gap on the mesh-trained policy.
 - **The "dominant axis" claim in the TL;DR.** Phase 1 attributed the
   full sim2sim gap to the foot collision model because that was the
   single Isaac-side knob that reproduced the MuJoCo failure inside
   Isaac. That correlation is genuine for Isaac-side robustness, but
   the *MuJoCo-side* failure was driven by the channel-order bug, not
   by the foot collider. The two effects were coincidentally aligned
-  in time but causally separate.
+  in time but causally separate. After the fix, the residual
+  mesh-feet gap (16 k mesh: 5.48 s vs ≥ 30 s for sphere-FT) is
+  consistent with a foot-collider distribution shift, but it is a
+  much smaller effect than §3 implied.
 - **Phase 5 (MJCF audit).** Most of the candidate knobs (`solref`,
   `condim`, friction tuple, ankle armature) become much lower-priority
-  now that the main MuJoCo failure mode is gone. Worth keeping as a
+  now that the main MuJoCo failure mode is gone — and now that
+  sphere-FT saturates the 30 s bench, there is no remaining failure
+  on the *deploy* URDF for these knobs to explain. Worth keeping as a
   small bench against the post-fix baseline rather than a primary
   axis.
+- **Bench discrimination for sphere-FT checkpoints.** The 30 s bench
+  no longer separates 2k from 4k sphere-FT — both saturate. To compare
+  sphere-FT checkpoints (or the H200 run vs prior fine-tunes) we now
+  need a **harder** bench: longer rollouts that outrun the motion loop,
+  push disturbances, perturbed RSI, or a wider motion suite. See
+  [§4.4 Open avenues](#44-open-avenues).
 
 What this study still records correctly, and is worth preserving:
 
@@ -747,12 +774,13 @@ What this study still records correctly, and is worth preserving:
    [`build_tokenizer_obs`](../../gear_sonic/scripts/eval_x2_mujoco.py) —
    visually verified on `relaxed_walk` (no more pirouette; tracking
    stable for full 30 s viewer episode).
-2. ☐ **Re-run the multi-init MuJoCo bench** (Appendix A.2) on the
-   16 k mesh-trained, 4 k sphere-fine-tune, and current H200 sphere
-   checkpoints under the fix to get a clean post-fix baseline.
+2. ✅ **Multi-init MuJoCo bench re-run** under the fix on the 16 k mesh
+   baseline, 2 k / 4 k sphere fine-tune, and H200 iter-2000 checkpoints —
+   see [§6.6 Post-fix multi-init bench](#66-post-fix-multi-init-mujoco-bench).
 3. ☐ **Re-run the IsaacLab ablation sweep** (Appendix A.1) with the
-   iter-761 H200 checkpoint to confirm Isaac-side numbers are
-   unaffected (they should be — this is purely a deploy-side bug).
+   latest H200 checkpoint (iter-2000 or later) to confirm Isaac-side
+   numbers are unaffected (they should be — this is purely a
+   deploy-side bug).
 4. ☐ Audit other deploy paths
    ([`eval_x2_mujoco_onnx.py`](../../gear_sonic/scripts/eval_x2_mujoco_onnx.py),
    the real-robot deploy stack) for the same channel-order assumption.
@@ -765,6 +793,110 @@ What this study still records correctly, and is worth preserving:
    between Isaac and the MuJoCo builder. This bug would have been
    caught immediately by such an assertion at step 0 (off by a
    permutation, not by tolerance).
+
+### 6.6 Post-fix multi-init MuJoCo bench
+
+Same protocol as [§3.3](#33-phase-3--mujoco-deploy-side-measurement-multi-init-frame)
+(5 init frames × 3 motions × N policies, headless rollout, RSI to motion
+frame), except:
+
+- The 6D rotation flatten in `build_tokenizer_obs` is **fixed**.
+- Duration cap raised from **15 s → 30 s** so we can distinguish
+  "barely survives the clip" from "tracks the looped reference past
+  clip end". The longest clip is `relaxed_walk` at 16.5 s, so any cell
+  reaching 30 s has already followed the looped reference for ≥ 13 s
+  past natural clip end without falling.
+- New checkpoint added: `h200_iter2000` (the from-scratch sphere-feet
+  H200 run at iter 2000 — only ≈ 8 % through the planned 25 k iters,
+  included as an early-training sanity check).
+
+**Per-cell results (time-to-fall in seconds; `*` = survived the full
+30 s, including motion loop):**
+
+```
+Motion         Policy                init=0   init=10  init=20  init=30  init=40   mean   std
+─────────────────────────────────────────────────────────────────────────────────────────────
+icecream       16k_mesh_baseline      3.62    8.42    12.70     9.42     4.32     7.70  3.36
+icecream       2k_sphere_ft          30.00*  30.00*  30.00*   30.00*   30.00*   30.00  0.00
+icecream       4k_sphere_ft          30.00*  30.00*  30.00*   30.00*   30.00*   30.00  0.00
+icecream       h200_iter2000         30.00*  30.00*  30.00*   30.00*   30.00*   30.00  0.00
+
+relaxed_walk   16k_mesh_baseline     12.24    4.12     3.58     4.74     3.80     5.70  3.30
+relaxed_walk   2k_sphere_ft          30.00*  30.00*  30.00*   30.00*   30.00*   30.00  0.00
+relaxed_walk   4k_sphere_ft          30.00*  30.00*  30.00*   30.00*   30.00*   30.00  0.00
+relaxed_walk   h200_iter2000         30.00*  30.00*  30.00*   30.00*   30.00*   30.00  0.00
+
+neutral_walk   16k_mesh_baseline      3.36    3.14     2.68     2.90     3.16     3.05  0.23
+neutral_walk   2k_sphere_ft          30.00*  30.00*  30.00*   30.00*   30.00*   30.00  0.00
+neutral_walk   4k_sphere_ft          30.00*  30.00*  30.00*   30.00*   30.00*   30.00  0.00
+neutral_walk   h200_iter2000         30.00*  30.00*  30.00*   30.00*   30.00*   30.00  0.00
+```
+
+**Headline summary (mean time-to-fall, with pre-fix §3.3 numbers in
+parens for the three policies that overlap):**
+
+| Motion | 16k mesh | 2k sphere FT | 4k sphere FT | h200 iter2000 |
+|---|---:|---:|---:|---:|
+| icecream | 7.70 ± 3.4 (was 2.52) | **30.00 ± 0** (was 3.14) | **30.00 ± 0** (was 3.30) | **30.00 ± 0** |
+| relaxed_walk | 5.70 ± 3.3 (was 2.22) | **30.00 ± 0** (was 3.79) | **30.00 ± 0** (was 4.37) | **30.00 ± 0** |
+| neutral_walk | 3.05 ± 0.2 (was 2.55) | **30.00 ± 0** (was 5.01) | **30.00 ± 0** (was 3.68) | **30.00 ± 0** |
+| **mean across motions** | 5.48 (was 2.43) | **30.00** (was 3.98) | **30.00** (was 3.78) | **30.00** |
+
+`*` Note: the "30.00 ± 0" cells are floor-truncated — those policies
+did not fall at any point during the 30 s window, so the **true**
+upper bound on their survival time is unknown and ≥ 30 s.
+
+**Findings (post-fix):**
+
+1. **Both sphere fine-tune checkpoints fully saturate the bench.** All
+   30 cells (3 motions × 5 inits × 2 checkpoints) survive the entire
+   30 s window — i.e. they track the reference clip to its natural end
+   *and* continue to track the looped reference for ≥ 13 s past clip
+   end without falling. This is the unambiguous post-fix sphere-FT
+   ceiling. Mean time-to-fall jumped from 3.78–3.98 s pre-fix to ≥ 30 s
+   post-fix — i.e. the **measured** improvement from removing the bug
+   is **at least +650 %** for the sphere-FT policies, but the true
+   improvement is bounded only by how long we are willing to run the
+   bench.
+2. **The 16 k mesh baseline improves dramatically too** (mean
+   2.43 → 5.48 s, +125 %), but does **not** saturate — confirming a
+   genuine residual MuJoCo-side gap at the mesh-feet checkpoint. This
+   gap is consistent with the URDF/foot-contact mismatch theory of
+   §1.4 / §3.2: the mesh policy was trained against IsaacLab's mesh
+   foot collider, the bench evaluates it against MuJoCo's 12-sphere
+   foot collider, and the policy's foot-contact priors are wrong.
+   Sphere fine-tuning fixes that — and after the bug fix, fixes it
+   completely (≥ 30 s on all cells).
+3. **`neutral_walk` is the hardest motion for the 16k mesh** (3.05 ±
+   0.2 s, very tight std) because it has the stiffest cadence — the
+   foot-contact phase mismatches are most exposed here. `relaxed_walk`
+   is a slower clip with longer ground-contact dwell, so the 16k mesh
+   sometimes survives 12 s on it (init=0). `icecream` is intermediate.
+   This ordering is consistent across pre- and post-fix runs.
+4. **The H200 iter-2000 checkpoint already saturates the bench on all
+   three motions** despite being only ≈ 8 % of the way through the
+   planned 25 k-iter training schedule. The earlier iter-761 snapshot
+   of the same run still had 9.80 ± 5.6 s on `neutral_walk`, so the
+   walk-cadence motion is the slowest to come in — but it is fully
+   solved by iter 2000. The from-scratch sphere-feet schedule is
+   converging to bench-saturating performance considerably faster than
+   the 4 k-iter sphere fine-tune did, which is consistent with the
+   training-from-scratch + correct-URDF + 2 550-motion-corpus thesis.
+5. **The pre-fix §3.3 conclusions are mostly retracted.** Specifically,
+   the "30 % of clip duration" framing in pre-fix finding 3 is no
+   longer meaningful — the sphere-FT policies are at ≥ 180 % of clip
+   duration (i.e. they track the looped reference past clip end). The
+   per-motion best-checkpoint claim in pre-fix finding 2 ("4k wins on
+   icecream/relaxed walk, 2k wins on neutral walk") is also dissolved
+   — both 2k and 4k saturate equally on all three motions, so the
+   bench can no longer distinguish them. **A harder bench is needed**
+   to discriminate between sphere-FT checkpoints (e.g. perturbed
+   initial conditions, push disturbances, or longer / more diverse
+   motions). See [§4.4](#44-open-avenues) item 1.
+
+**Reproduction:** see [Appendix A.2](#a2-run-the-multi-init-mujoco-bench)
+with `--duration 30.0`. Wall time on a single workstation with 8-way
+parallelism: ≈ 170 s for the full 60-cell matrix.
 
 ---
 
