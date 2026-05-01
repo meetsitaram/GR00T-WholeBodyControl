@@ -640,6 +640,11 @@ ori_6d = np.concatenate([rot_mat[:, 0], rot_mat[:, 1]]).astype(np.float32)
 ori_6d = rot_mat[:, :2].reshape(-1).astype(np.float32)
 ```
 
+Side-by-side rollout (same checkpoint, same motion, same RSI init,
+first 4 s; column-major on the left, row-major on the right):
+
+![Side-by-side MuJoCo rollout, before vs after the 6D rotation flatten fix](../_static/sim2sim_demo/sim2sim_6d_fix.gif)
+
 Re-running the same iter-761 checkpoint, same motions, same physics:
 
 | motion       | BEFORE fix      | AFTER fix         | yaw drift (0–5 s) |

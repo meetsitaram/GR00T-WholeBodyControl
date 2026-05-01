@@ -888,6 +888,14 @@ ori_6d = np.concatenate([rot_mat[:, 0], rot_mat[:, 1]]).astype(np.float32)
 ori_6d = rot_mat[:, :2].reshape(-1).astype(np.float32)
 ```
 
+**Visual demo** — same checkpoint (`4k_sphere_ft`), same motion
+(`Relaxed_walk_forward_002__A057_M_postfix`), same RSI init frame,
+first 4 seconds of the rollout. Left: column-major bug (robot
+pirouettes ~180° within 2 s and walks the wrong way). Right: row-major
+fix (robot tracks the motion's southward heading correctly).
+
+![Side-by-side MuJoCo rollout, before vs after the 6D rotation flatten fix](../_static/sim2sim_demo/sim2sim_6d_fix.gif)
+
 **Post-fix validation** (same checkpoint, same motions, same physics):
 
 | motion       | BEFORE fix      | AFTER fix         | yaw drift (0–5 s) |
