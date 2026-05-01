@@ -2,6 +2,55 @@
 
 **Source comparison:** `agibot_x1_train` (cloned `main`) vs your `GR00T-WholeBodyControl` branch `wip/mujoco-experiments-20260420`. All numbers below are taken from actual files, not estimates.
 
+> ## ⚠️ Status (2026-05-01) — what we actually did with these recommendations
+>
+> This document was written **before** the 2026-05-01 root-cause discovery
+> (see [`sim2sim_mujoco.md` G20](sim2sim_mujoco.md) /
+> [`sim2sim_ablation_study.md` §6](sim2sim_ablation_study.md)). It frames
+> the X2 → MuJoCo gap as a *training-side* problem and prescribes a
+> long list of X1-style fixes. After evaluating each recommendation,
+> here is the honest status of every action item:
+>
+> | Recommendation | Action taken | Verdict |
+> |---|---|---|
+> | Download AgiBot X2 v1.3.0 URDF zip and diff against ours | **Skipped.** Cloned `agibot_x1_train` instead, found that our hand-authored `x2_ultra_sphere_feet.urdf` is **byte-equivalent** to AgiBot's `x2_ultra_simple_collision.urdf`. The asset coherence problem the doc worries about was already solved. | ✅ Validated, no action needed |
+> | Adopt X1 hand-tuned PD (Hip KP=30-40, Knee=100, Ankle=35, action_scale=0.5) | **Not adopted.** Our `armature × ω²` formula gives a self-consistent table that has already been validated against G16b ankle-only-scaling and G17 walking-PD sweep — both negative for further hand-tuning. | ❌ Declined |
+> | Add 100 lines of X1-style DR (latency, joint armature wide, coulomb friction, torque multiplier, …) | **Not adopted.** Our existing DR (push, mass, CoM, friction-material, action noise) was already substantial. The dominant MuJoCo failure mode turned out to be the 6D rotation channel-order bug, not missing DR — see G20. | ❌ Premise invalidated |
+> | Add observation noise (`dof_vel` ~2.25 rad/s, etc.) | **Not adopted.** Same reason as above — the gap this was meant to close was a measurement artifact, not a real distribution shift. | ❌ Premise invalidated |
+> | Add regularization rewards (`action_smoothness`, `dof_acc`, torque penalties) | **Not adopted.** Our reward stack already has tracking + termination shaping; the predicted "policy chatters in MuJoCo" symptom never reproduced once the heading bug was fixed. | ❌ Premise invalidated |
+> | Halve all KPs and double action_scale ("more PD headroom") | **Not tried.** G17 already swept waist KP ×3/×5 and knee KP ×1.5/KD ×0.5 across walking motions and every config tied or regressed; that result generalises against this proposal too. | ❌ Declined |
+> | Drop modeled armature, use X1-style uniform `damping=1` | **Not tried.** G12 system-IDed per-joint armature and saw measurable sim2sim improvements; reverting that is a regression, not a fix. | ❌ Declined |
+>
+> **Why almost every recommendation was declined:** the doc was written
+> on the assumption that the X2 → MuJoCo gap was a real, large,
+> physics-driven distribution shift. The 2026-05-01 finding (G20) shows
+> that the dominant failure mode — the dramatic 2-5 s collapse, the
+> 180° pirouette in the first second — was a deploy-side 6D rotation
+> flatten-ordering bug, not a physics gap. Once that is fixed, the
+> remaining MuJoCo deltas are small enough that the "wholesale adopt
+> X1's recipe" framing of this doc is the wrong tool for closing them.
+>
+> **What's still useful in this document:**
+>
+> - The X1 PD / DR / observation-noise / regularization tables are an
+>   excellent reference for understanding what a "humanoid-gym
+>   philosophy" training recipe looks like, and may be worth
+>   consulting when we *do* hit a real training-side DR-bandwidth
+>   limit (e.g. for sim-to-real or for embodiments where the placeholder
+>   armature values matter).
+> - Section "The X1 MJCF: what's actually in it" articulates two valid
+>   philosophies (simple-MJCF + wide-DR vs rich-MJCF + measured params)
+>   and is independent of the 6D-rotation bug. Worth re-reading when
+>   the next embodiment lands.
+>
+> **Re-evaluate after the post-fix baseline lands.** Once we re-run the
+> multi-init MuJoCo bench under the G20 fix on the 16 k mesh, 4 k
+> sphere fine-tune, and current H200 sphere checkpoints (action item
+> in §6.5 of `sim2sim_ablation_study.md`), most of the remaining
+> apparent "gap" may evaporate. If a real residual gap remains, the
+> X1 DR additions in §"Domain Randomization" below are the most
+> credible next intervention.
+
 ## Headline finding
 
 You've already done substantially more careful sim-to-real engineering than the X1 recipe contains. Your X2 MJCF has per-joint armature classes, frictionloss, foot collision spheres, documented experiments (G13, G14, G16b), and your eval script does proper PD with action_scale derived from effort limits. **The asset is not your problem.**
