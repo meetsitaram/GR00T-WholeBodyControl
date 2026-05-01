@@ -888,13 +888,28 @@ ori_6d = np.concatenate([rot_mat[:, 0], rot_mat[:, 1]]).astype(np.float32)
 ori_6d = rot_mat[:, :2].reshape(-1).astype(np.float32)
 ```
 
-**Visual demo** — same checkpoint (`4k_sphere_ft`), same motion
-(`Relaxed_walk_forward_002__A057_M_postfix`), same RSI init frame,
-first 4 seconds of the rollout. Left: column-major bug (robot
-pirouettes ~180° within 2 s and walks the wrong way). Right: row-major
-fix (robot tracks the motion's southward heading correctly).
+**Visual demo** — same motion
+(`Relaxed_walk_forward_002__A057_M_postfix`), same RSI init frame
+(0), first 4 seconds of each rollout, side by side. Left frame =
+pre-fix column-major flatten; right frame = post-fix row-major flatten.
 
-![Side-by-side MuJoCo rollout, before vs after the 6D rotation flatten fix](../_static/sim2sim_demo/sim2sim_6d_fix.gif)
+`4k_sphere_ft` (the sphere-feet fine-tune of the 16 k mesh baseline)
+— pre-fix collapses in 3.8 s after a clean 180 ° pirouette; post-fix
+walks the full clip cleanly. **The fix alone unlocks the fine-tune
+that was already trained — no retraining required.**
+
+![Side-by-side MuJoCo rollout (4k_sphere_ft), before vs after the 6D rotation flatten fix](../_static/sim2sim_demo/sim2sim_6d_fix__4k_sphere_ft.gif)
+
+`16k_mesh_baseline` (the original mesh-feet trained policy) — pre-fix
+collapses in **2.22 s** (matches the original Phase 3 ablation
+measurement to the centisecond, confirming bit-exact reproduction).
+Post-fix walks for **12.24 s** — much further, but **still falls
+before the clip ends** because this policy was trained against a
+mesh-foot URDF and is now being deployed against a sphere-foot MJCF.
+The G20 fix removes the encoding bug; the residual gap is the
+genuine wrong-URDF provenance bug from §1.4 of the ablation study.
+
+![Side-by-side MuJoCo rollout (16k_mesh_baseline), before vs after the 6D rotation flatten fix](../_static/sim2sim_demo/sim2sim_6d_fix__16k_mesh.gif)
 
 **Post-fix validation** (same checkpoint, same motions, same physics):
 

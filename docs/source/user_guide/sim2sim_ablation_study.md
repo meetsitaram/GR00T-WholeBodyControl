@@ -640,10 +640,24 @@ ori_6d = np.concatenate([rot_mat[:, 0], rot_mat[:, 1]]).astype(np.float32)
 ori_6d = rot_mat[:, :2].reshape(-1).astype(np.float32)
 ```
 
-Side-by-side rollout (same checkpoint, same motion, same RSI init,
-first 4 s; column-major on the left, row-major on the right):
+Side-by-side rollouts on the same motion (`relaxed_walk_postfix`,
+`init=0`), first 4 s; column-major on the left, row-major on the
+right.
 
-![Side-by-side MuJoCo rollout, before vs after the 6D rotation flatten fix](../_static/sim2sim_demo/sim2sim_6d_fix.gif)
+The `4k_sphere_ft` fine-tune — pre-fix falls in 3.8 s after the
+characteristic 180 ° pirouette; post-fix walks the full 15 s clip
+cleanly:
+
+![Side-by-side MuJoCo rollout (4k_sphere_ft)](../_static/sim2sim_demo/sim2sim_6d_fix__4k_sphere_ft.gif)
+
+The `16k_mesh_baseline` (original mesh-feet trained policy) —
+pre-fix falls in **2.22 s** (bit-exact reproduction of the Phase 3
+measurement); post-fix walks **12.24 s** but still falls before the
+clip ends because this policy is mesh-trained and deployed against
+a sphere-foot MJCF. The G20 fix removes the encoding bug; the
+residual is the genuine wrong-URDF provenance gap diagnosed in §1.4:
+
+![Side-by-side MuJoCo rollout (16k_mesh_baseline)](../_static/sim2sim_demo/sim2sim_6d_fix__16k_mesh.gif)
 
 Re-running the same iter-761 checkpoint, same motions, same physics:
 
