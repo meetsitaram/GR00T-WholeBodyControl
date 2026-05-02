@@ -243,14 +243,21 @@ manually and want to short-circuit a re-run):
 
 ### Powered run — current safest settings
 
+The script auto-relaunches inside the `docker_x2/x2sim` container if invoked
+from a host shell (no `/workspace/sonic`), mounting `$HOME` at `$HOME` so
+all your paths just work. No more manual
+`cd docker_x2 && docker compose run --rm --service-ports x2sim bash -lc ...`
+incantation. Use `--no-docker` to opt out (requires ROS + aimdk_msgs sourced
+on the host).
+
 ```bash
 ./gear_sonic_deploy/deploy_x2.sh local \
-    --model /workspace/sonic/gear_sonic_deploy/models/x2_sonic_16k.onnx \
-    --motion /workspace/sonic/gear_sonic_deploy/data/motions_x2m2/x2_ultra_take_a_sip.x2m2 \
+    --model  ~/x2_cloud_checkpoints/h200-iter-4000-20260501/model_step_004000.onnx \
+    --motion ./gear_sonic/data/motions/playlists/minimal_v1.yaml \
     --autostart-after 5 --max-duration 5 \
     --max-target-dev 0.30 --ramp-seconds 2.0 --tilt-cos -0.3 \
     --return-seconds 2.0 \
-    --log-dir /workspace/sonic/logs/x2/takesip_$(date +%Y%m%d_%H%M%S)
+    --log-dir /tmp/minv1_$(date +%Y%m%d_%H%M%S)
 ```
 
 ### RAMP_OUT confirmation ladder (3 runs, used 2026-04-27)

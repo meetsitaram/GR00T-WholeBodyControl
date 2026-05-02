@@ -61,6 +61,125 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # gear_sonic/data/motions/playlists/minimal_v1.yaml`` silently resolves the
 # motion path against gear_sonic_deploy/ and fails to find the file.
 USER_CWD="$(pwd)"
+
+# ============================================================================
+# Auto-relaunch inside the docker_x2/x2sim container if invoked from a host
+# shell that doesn't have ROS / aimdk_msgs sourced. Lets the user run
+#
+#   $ ./gear_sonic_deploy/deploy_x2.sh local --model ~/x2_cloud_checkpoints/.../m.onnx ...
+#
+# directly from the repo root without first doing the
+# `cd docker_x2 && docker compose run --rm --service-ports x2sim bash -c ...`
+# dance.
+#
+# Detection: we treat "running on the host" as "/workspace/sonic doesn't
+# exist" (the compose file binds the repo there inside the container).
+# Override with --no-docker for advanced users who already have ROS sourced
+# on the host, and respect $X2_DEPLOY_IN_DOCKER as a re-entry guard so the
+# in-container invocation doesn't loop.
+#
+# Mount strategy: bind-mount $HOME at the same path inside the container.
+# The compose file already binds the repo at /workspace/sonic and
+# ~/x2_cloud_checkpoints at /workspace/checkpoints, but those are CONTAINER
+# paths -- if the user passes ~/x2_cloud_checkpoints/.../m.onnx (the natural
+# host path) we want it to resolve identically inside without the wrapper
+# having to translate every PATH-bearing flag. Mounting $HOME -> $HOME at
+# the same absolute path solves both directions in one line.
+#
+# Real-mode env: the compose file pins ROS_LOCALHOST_ONLY=1 / ROS_DOMAIN_ID=73
+# (sim DDS isolation). Real-robot modes need to talk to the actual robot, so
+# we override both unless the user has set X2_REAL_DOMAIN_ID. Sim mode keeps
+# the compose defaults.
+maybe_relaunch_in_docker() {
+    # Already inside the container, or invoked from a host shell that already
+    # has ROS sourced and the user opted out via --no-docker.
+    if [[ -d /workspace/sonic ]] || [[ -n "${X2_DEPLOY_IN_DOCKER:-}" ]]; then
+        return 0
+    fi
+    for a in "$@"; do
+        case "$a" in
+            # User opt-out, or "no-ROS-needed" invocations: --help prints
+            # usage and exits, --build-only doesn't talk to robot or ROS at
+            # all (just colcon). We don't want to spin up a docker container
+            # just to print --help text or rebuild C++.
+            --no-docker|-h|--help|--build-only) return 0 ;;
+        esac
+    done
+
+    # docker not available -> let the caller fail naturally (e.g. with the
+    # rclpy ModuleNotFoundError that the preflight will throw). We'd rather
+    # fail loudly than silently no-op.
+    if ! command -v docker &>/dev/null; then
+        echo -e "\033[1;33mNote: 'docker' not in PATH and ROS doesn't look sourced;\033[0m" >&2
+        echo -e "\033[1;33m       deploy_x2.sh is going to fail on rclpy/aimdk_msgs imports.\033[0m" >&2
+        echo -e "\033[1;33m       Either install docker + run the docker_x2 container, or${NC}" >&2
+        echo -e "\033[1;33m       source ROS 2 + aimdk_msgs and re-run with --no-docker.${NC}" >&2
+        return 0
+    fi
+
+    local compose_dir="$SCRIPT_DIR/docker_x2"
+    if [[ ! -f "$compose_dir/docker-compose.yml" ]]; then
+        return 0
+    fi
+
+    # Sniff mode (first non-flag positional arg). Defaults to "local" to match
+    # the deploy_x2.sh default further down.
+    local mode="local"
+    for a in "$@"; do
+        case "$a" in
+            sim|local|onbot)
+                mode="$a"; break ;;
+            -*) ;;  # flag, skip
+            *) break ;;  # unknown positional -> stop sniffing
+        esac
+    done
+
+    local env_overrides=()
+    if [[ "$mode" != "sim" ]]; then
+        env_overrides+=(
+            "-e" "ROS_LOCALHOST_ONLY=0"
+            "-e" "ROS_DOMAIN_ID=${X2_REAL_DOMAIN_ID:-0}"
+        )
+    fi
+
+    local tty_args=("-T")  # no TTY by default (works in scripts/CI)
+    if [[ -t 0 && -t 1 ]]; then
+        tty_args=()  # interactive shell -> let docker compose allocate TTY
+    fi
+
+    echo -e "\033[0;34m[auto-docker]\033[0m re-exec inside docker_x2/x2sim ($mode mode)"
+    echo -e "\033[0;34m[auto-docker]\033[0m mounting \$HOME ($HOME) at $HOME inside container"
+    if [[ "$mode" != "sim" ]]; then
+        echo -e "\033[0;34m[auto-docker]\033[0m clearing sim DDS isolation (ROS_LOCALHOST_ONLY=0, ROS_DOMAIN_ID=${X2_REAL_DOMAIN_ID:-0})"
+    fi
+    echo -e "\033[0;34m[auto-docker]\033[0m use --no-docker to bypass (requires ROS sourced on host)"
+    echo ""
+
+    local pwd_abs="$USER_CWD"
+    # Use the CONTAINER script path so SCRIPT_DIR inside the re-exec resolves
+    # to /workspace/sonic/gear_sonic_deploy. That path has the colcon
+    # install/build/log docker volumes attached (see docker-compose.yml);
+    # the host-side $HOME mount we add below points at the same source
+    # files but does NOT carry the colcon volumes, so a SCRIPT_DIR resolved
+    # against the host path would yield "Package agi_x2_deploy_onnx_ref not
+    # found" at ros2 run time.
+    local script_in_container="/workspace/sonic/gear_sonic_deploy/$(basename "${BASH_SOURCE[0]}")"
+
+    cd "$compose_dir"
+    export X2_DEPLOY_IN_DOCKER=1
+    exec docker compose run --rm --service-ports \
+        "${tty_args[@]}" \
+        "${env_overrides[@]}" \
+        -e "X2_DEPLOY_IN_DOCKER=1" \
+        -v "$HOME:$HOME:rw" \
+        -w "$pwd_abs" \
+        x2sim \
+        bash -lc 'source /opt/ros/humble/setup.bash && source /ros2_ws/install/setup.bash && exec "$@"' \
+        bash "$script_in_container" "$@"
+}
+
+maybe_relaunch_in_docker "$@"
+
 cd "$SCRIPT_DIR"
 
 PKG_NAME="agi_x2_deploy_onnx_ref"
@@ -440,6 +559,17 @@ Pre-flight + behaviour toggles:
   --no-build                  Skip the colcon build step (use the existing
                               install/ tree as-is)
   --build-only                Build, don't run
+  --no-docker                 Do NOT auto-relaunch inside the docker_x2/x2sim
+                              container. Default behaviour is: if
+                              /workspace/sonic doesn't exist (i.e. you're on
+                              a host shell), the script re-execs itself
+                              inside the container with \$HOME mounted at
+                              \$HOME so all your paths just work. Pass this
+                              flag if you've already sourced ROS 2 +
+                              aimdk_msgs on the host and want to run
+                              natively. Also honoured via the
+                              X2_DEPLOY_IN_DOCKER=1 env var (set
+                              automatically by the auto-relaunch).
   --no-preflight-py           Skip the gantry-aware Python preflight
                               (gear_sonic_deploy/scripts/x2_preflight.py).
                               Default: preflight runs in local/onbot mode
@@ -516,6 +646,7 @@ while [[ $# -gt 0 ]]; do
         --no-preflight-py)    NO_PREFLIGHT_PY=true; shift ;;
         --preflight-strict)   PREFLIGHT_STRICT=true; shift ;;
         --preflight-args)     PREFLIGHT_ARGS="$2"; shift 2 ;;
+        --no-docker)          shift ;;  # consumed by maybe_relaunch_in_docker
         --sim-mjcf)               SIM_MJCF="$2"; shift 2 ;;
         --sim-motion)             SIM_MOTION="$2"; shift 2 ;;
         --sim-init-frame)         SIM_INIT_FRAME="$2"; shift 2 ;;
