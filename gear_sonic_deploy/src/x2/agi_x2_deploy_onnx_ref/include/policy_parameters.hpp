@@ -59,7 +59,7 @@ constexpr double SIM_DT = 0.005;
 constexpr int DECIMATION = 4;
 constexpr double DT_FUTURE_REF = 0.1;
 
-// ---------- Joint name table (MuJoCo order) ----------
+// ---------- Joint name table (MJCF order; canonical) ----------
 const std::array<const char*, 31> mujoco_joint_names = {
     "left_hip_pitch_joint",
     "left_hip_roll_joint",
@@ -107,14 +107,14 @@ const std::array<double, 31> kps = {
     99.09842778, // left_hip_roll_joint
     99.09842778, // left_hip_yaw_joint
     99.09842778, // left_knee_joint
-    14.2506231, // left_ankle_pitch_joint
-    14.2506231, // left_ankle_roll_joint
+    21.37593465, // left_ankle_pitch_joint
+    21.37593465, // left_ankle_roll_joint
     99.09842778, // right_hip_pitch_joint
     99.09842778, // right_hip_roll_joint
     99.09842778, // right_hip_yaw_joint
     99.09842778, // right_knee_joint
-    14.2506231, // right_ankle_pitch_joint
-    14.2506231, // right_ankle_roll_joint
+    21.37593465, // right_ankle_pitch_joint
+    21.37593465, // right_ankle_roll_joint
     40.17923847, // waist_yaw_joint
     14.2506231, // waist_pitch_joint
     14.2506231, // waist_roll_joint
