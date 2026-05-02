@@ -366,6 +366,23 @@ def load_motion_data(path):
     return joblib.load(path)
 
 
+def load_playlist_motion_data(playlist_path):
+    """Build a single-clip motion-lib dict from a warehouse playlist YAML.
+
+    Reuses ``_warehouse_playlist.build_concat`` so the in-memory dict is
+    bit-identical to ``make_warehouse_motion.py --out`` for the same YAML
+    (verified by the stitcher's ``--check-runtime-parity`` flag). Lets us
+    iterate on the playlist YAML without re-running the stitcher CLI.
+    """
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent))
+    from _warehouse_playlist import build_concat, load_playlist  # type: ignore
+    pl = load_playlist(_Path(playlist_path))
+    motion = build_concat(pl)
+    return {pl.output_key: motion}
+
+
 def _m(data):
     return data[list(data.keys())[0]]
 
@@ -617,7 +634,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--motion", required=True)
+    motion_grp = parser.add_mutually_exclusive_group(required=True)
+    motion_grp.add_argument("--motion", help="Single-clip motion-lib PKL.")
+    motion_grp.add_argument(
+        "--playlist",
+        help="Warehouse playlist YAML (resolved via _warehouse_playlist."
+             "build_concat into a virtual single-clip motion). Mutually "
+             "exclusive with --motion.",
+    )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--speed", type=float, default=1.0)
     parser.add_argument(
@@ -713,8 +737,12 @@ def main():
     actor = load_actor_from_checkpoint(args.checkpoint, args.device)
     print("  Actor loaded.", flush=True)
 
-    print(f"Loading motion from {args.motion} ...", flush=True)
-    motion_data = load_motion_data(args.motion)
+    if args.playlist is not None:
+        print(f"Loading playlist from {args.playlist} ...", flush=True)
+        motion_data = load_playlist_motion_data(args.playlist)
+    else:
+        print(f"Loading motion from {args.motion} ...", flush=True)
+        motion_data = load_motion_data(args.motion)
     total_frames = get_total_frames(motion_data)
     motion_fps = get_motion_fps(motion_data)
     print(f"  {total_frames} frames @ {motion_fps} fps = {total_frames / motion_fps:.1f}s",

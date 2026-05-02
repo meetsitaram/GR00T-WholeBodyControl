@@ -89,6 +89,7 @@ from eval_x2_mujoco import (  # noqa: E402  (sys.path setup must come first)
     get_total_frames,
     load_actor_from_checkpoint,
     load_motion_data,
+    load_playlist_motion_data,
     quat_rotate_inverse,
 )
 
@@ -266,7 +267,13 @@ def main():
         required=True,
         help="Path to fused encoder+decoder ONNX (e.g. model_step_002000_g1.onnx).",
     )
-    parser.add_argument("--motion", required=True, help="Reference motion PKL.")
+    motion_grp = parser.add_mutually_exclusive_group(required=True)
+    motion_grp.add_argument("--motion", help="Reference motion PKL.")
+    motion_grp.add_argument(
+        "--playlist",
+        help="Warehouse playlist YAML (resolved via _warehouse_playlist."
+             "build_concat). Mutually exclusive with --motion.",
+    )
     parser.add_argument(
         "--compare-pt",
         default=None,
@@ -348,8 +355,12 @@ def main():
             flush=True,
         )
 
-    print(f"Loading motion from {args.motion} ...", flush=True)
-    motion_data = load_motion_data(args.motion)
+    if args.playlist is not None:
+        print(f"Loading playlist from {args.playlist} ...", flush=True)
+        motion_data = load_playlist_motion_data(args.playlist)
+    else:
+        print(f"Loading motion from {args.motion} ...", flush=True)
+        motion_data = load_motion_data(args.motion)
     total_frames = get_total_frames(motion_data)
     motion_fps = get_motion_fps(motion_data)
     print(

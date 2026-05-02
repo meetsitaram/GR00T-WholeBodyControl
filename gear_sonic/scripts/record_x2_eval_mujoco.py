@@ -56,6 +56,7 @@ from gear_sonic.scripts.eval_x2_mujoco import (  # noqa: E402
     build_tokenizer_obs,
     compute_motion_state,
     load_actor_from_checkpoint,
+    load_playlist_motion_data,
     quat_rotate_inverse,
 )
 
@@ -80,8 +81,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--motion", required=True,
-                        help="Single-clip motion-lib PKL (first key is used).")
+    motion_grp = parser.add_mutually_exclusive_group(required=True)
+    motion_grp.add_argument("--motion",
+                             help="Single-clip motion-lib PKL (first key is used).")
+    motion_grp.add_argument(
+        "--playlist",
+        help="Warehouse playlist YAML (resolved via _warehouse_playlist."
+             "build_concat). Mutually exclusive with --motion.",
+    )
     parser.add_argument("--out", required=True, help="Output MP4 path.")
     parser.add_argument("--duration", type=float, default=10.0,
                         help="Seconds of rollout to record (default 10).")
@@ -113,9 +120,13 @@ def main():
     actor = load_actor_from_checkpoint(args.checkpoint, args.device)
     print("  Actor loaded.", flush=True)
 
-    print(f"Loading motion from {args.motion} ...", flush=True)
-    import joblib  # local to defer
-    motion_data = joblib.load(args.motion)
+    if args.playlist is not None:
+        print(f"Loading playlist from {args.playlist} ...", flush=True)
+        motion_data = load_playlist_motion_data(args.playlist)
+    else:
+        print(f"Loading motion from {args.motion} ...", flush=True)
+        import joblib  # local to defer
+        motion_data = joblib.load(args.motion)
     mk = next(iter(motion_data))
     motion_entry = motion_data[mk]
     total_frames = motion_entry["dof"].shape[0]
