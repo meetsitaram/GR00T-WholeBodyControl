@@ -241,6 +241,50 @@ manually and want to short-circuit a re-run):
 ./gear_sonic_deploy/deploy_x2.sh local --no-preflight-py ...
 ```
 
+### Real-deploy tuning presets (parity-safe)
+
+Real-robot-only post-policy knobs (per-joint clamp, output target LPF) are
+captured in YAML presets under
+`gear_sonic_deploy/configs/real_deploy_tuning/` and loaded via
+`deploy_x2.sh --tuning-config PATH.yaml`. Two presets ship today:
+
+* `conservative.yaml` — first-run validation. Tight `max_target_dev=0.30`,
+  no LPF. Use after a new checkpoint or motion playlist.
+* `expressive.yaml` — `max_target_dev=0.80` + `target_lpf_hz=8`. Use after
+  conservative passes; gives the policy room to track wider arm motions
+  while the EMA filter tames leg/waist jitter from real sensor noise.
+
+**Parity rule.** `--tuning-config` is **rejected in sim mode**. Sim
+profiles (`parity`, `handoff`, `gantry`, `gantry-dangle`) must keep
+talking to the deploy binary with bit-identical CLI flags so
+`compare_deploy_vs_python_obs.py` keeps comparing apples to apples.
+Architecturally, every knob in a preset that *could* affect the
+observation stream lives strictly downstream of the policy: the LPF runs
+**after** `ApplySafetyStack`, and `--obs-dump` returns from `OnControl`
+before the LPF code path is even reached. Adding a knob here that affects
+inputs to the policy must come with an explicit "breaks parity" warning
+in `_schema.yaml`. See
+`gear_sonic_deploy/configs/real_deploy_tuning/README.md` for the full
+contract and the procedure to add a new knob.
+
+```bash
+# Conservative — first powered run with iter-N
+./gear_sonic_deploy/deploy_x2.sh local \
+    --model  ~/x2_cloud_checkpoints/h200-iter-N/model_step_NNN.onnx \
+    --motion ./gear_sonic/data/motions/playlists/minimal_v1.yaml \
+    --autostart-after 5 --max-duration 5 \
+    --tuning-config gear_sonic_deploy/configs/real_deploy_tuning/conservative.yaml \
+    --record
+
+# Expressive — once conservative passes, opens up arm range + LPF
+./gear_sonic_deploy/deploy_x2.sh local \
+    --model  ~/x2_cloud_checkpoints/h200-iter-N/model_step_NNN.onnx \
+    --motion ./gear_sonic/data/motions/playlists/standing_gestures_v1.yaml \
+    --autostart-after 5 --max-duration 22 \
+    --tuning-config gear_sonic_deploy/configs/real_deploy_tuning/expressive.yaml \
+    --record
+```
+
 ### Powered run — current safest settings
 
 The script auto-relaunches inside the `docker_x2/x2sim` container if invoked

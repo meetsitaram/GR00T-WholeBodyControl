@@ -239,6 +239,15 @@ RAMP_SECONDS=""
 # --max-target-dev 0.05 (about 3 deg). See policy_parameters.hpp for the
 # trained standing pose this clamps around.
 MAX_TARGET_DEV=""
+
+# Output-side target LPF cutoff in Hz, forwarded to the deploy binary as
+# --target-lpf-hz. Empty string = use binary default (0 = bypass = parity-
+# safe). Real-deploy only -- enabling this in sim mode will diverge from
+# eval_x2_mujoco.py. Typically set via the tuning config preset, but
+# exposed as a passthrough flag so operators can do quick A/B sweeps off
+# a known-good preset (the binary's CLI parser is last-write-wins, so
+# this overrides whatever the preset put there).
+TARGET_LPF_HZ=""
 # Symmetric clip on the raw ONNX action (action_il) BEFORE x2_action_scale.
 # Empty string = let the C++ binary use its compiled-in default of 20.0,
 # which matches IsaacLab training-time config.action_clip_value. Set to a
@@ -334,6 +343,24 @@ SIM_RECORD_COMMANDS=""
 SIM_BRIDGE_PID=""
 SIM_RECORD_PID=""
 
+# Run recorder (--record) -- a sibling background process that subscribes to
+# /aima/hal/joint/{leg,waist,arm,head}/{state,command} + the IMU and dumps
+# everything to an .npz so we can do post-mortem cmd/state tracking-error
+# analysis on real-robot runs without two-terminal coordination. Started at
+# launch, stopped via SIGINT in the cleanup traps so the npz is finalised
+# even on Ctrl-C / abort.
+RECORD_RUN=false
+RECORD_OUT=""
+RUN_RECORD_PID=""
+
+# Real-deploy tuning config (--tuning-config PATH.yaml). Expanded to
+# CLI flags via gear_sonic_deploy/scripts/tuning_config_to_args.py and
+# prepended to ROS2_ARGS so explicit per-flag overrides on the command
+# line still win. REJECTED in sim modes -- tuning configs are real-robot
+# only by design, to keep the C++<->Python parity surface bit-exact.
+# See gear_sonic_deploy/configs/real_deploy_tuning/README.md.
+TUNING_CONFIG=""
+
 # ============================================================================
 # Usage
 # ============================================================================
@@ -373,6 +400,30 @@ Optional deploy flags (forwarded to ros2 run):
                               StandStillReference (NOT recommended for
                               policies trained on motion).
   --log-dir PATH              Per-tick CSV log directory
+  --record                    Background-record the full robot run (state +
+                              command + IMU on /aima/hal/*) to an .npz for
+                              post-mortem analysis. Recorder starts before
+                              the deploy launches, stops on script exit
+                              (Ctrl-C-safe: trap finalises the npz). Output
+                              defaults to --log-dir/run.npz, or
+                              /tmp/x2_run_<ts>.npz when --log-dir is unset.
+                              Use scripts/x2_record_real_run.py --summarize
+                              PATH.npz to print the cmd/state/track-err
+                              tables.
+  --record-out PATH           Implies --record. Override the .npz output path.
+  --tuning-config PATH        REAL-ROBOT ONLY (rejected in sim mode). Loads a
+                              YAML preset from
+                              gear_sonic_deploy/configs/real_deploy_tuning/
+                              and expands it to deploy-binary CLI flags
+                              (--max-target-dev, --target-lpf-hz, etc.).
+                              Explicit flags on this command line still win
+                              over the preset (they appear later in argv and
+                              the binary's parser is last-write-wins). Sim
+                              profiles deliberately refuse this flag so the
+                              C++<->Python parity surface against
+                              eval_x2_mujoco.py cannot be silently changed.
+                              Shipped presets: conservative.yaml,
+                              expressive.yaml. See README.md in that folder.
   --autostart-after SECONDS         Auto-transition WAIT->CONTROL after N seconds
                               (default: -1, wait for stdin 'go')
   --max-duration SECONDS      Auto-shutdown N seconds after entering CONTROL
@@ -390,6 +441,16 @@ Optional deploy flags (forwarded to ros2 run):
                               obs-construction bug cannot drive any joint
                               more than RAD away from the trained standing
                               pose, regardless of what the ONNX session emits.
+  --target-lpf-hz HZ          REAL-DEPLOY ONLY. First-order EMA cutoff (Hz)
+                              applied to the published joint targets AFTER the
+                              safety stack and BEFORE the bus, to tame jitter
+                              caused by noisy real sensor obs. 0 = disabled
+                              (default; preserves sim parity). Typically set
+                              via --tuning-config; this CLI flag exists so
+                              operators can override the preset for quick A/B
+                              sweeps. The C++ binary's parser is
+                              last-write-wins, so an explicit --target-lpf-hz
+                              here always trumps whatever a tuning config set.
   --action-clip RAD           Symmetric clip on the raw ONNX action (action_il)
                               BEFORE x2_action_scale. Default in the C++ binary
                               is 20.0, matching the training-time
@@ -623,11 +684,15 @@ while [[ $# -gt 0 ]]; do
         --model)              MODEL="$2"; shift 2 ;;
         --motion)             MOTION="$2"; shift 2 ;;
         --log-dir)            LOG_DIR="$2"; shift 2 ;;
+        --record)             RECORD_RUN=true; shift ;;
+        --record-out)         RECORD_RUN=true; RECORD_OUT="$2"; shift 2 ;;
+        --tuning-config)      TUNING_CONFIG="$2"; shift 2 ;;
         --autostart-after)          AUTOSTART="$2"; shift 2 ;;
         --max-duration)       MAX_DURATION="$2"; shift 2 ;;
         --tilt-cos)           TILT_COS="$2"; shift 2 ;;
         --ramp-seconds)       RAMP_SECONDS="$2"; shift 2 ;;
         --max-target-dev)     MAX_TARGET_DEV="$2"; shift 2 ;;
+        --target-lpf-hz)      TARGET_LPF_HZ="$2"; shift 2 ;;
         --action-clip)        ACTION_CLIP="$2"; shift 2 ;;
         --return-seconds)     RETURN_SECONDS="$2"; shift 2 ;;
         --imu-topic)          IMU_TOPIC="$2"; shift 2 ;;
@@ -728,6 +793,18 @@ if [[ "$MODE" == "local" || "$MODE" == "sim" ]]; then
     [[ -n "$MODEL" ]] && MODEL="$(abspath "$MODEL")"
     [[ -n "$MOTION" ]] && MOTION="$(abspath "$MOTION")"
     [[ -n "$LOG_DIR" ]] && LOG_DIR="$(abspath "$LOG_DIR")"
+
+    # Default --record output: alongside the per-tick CSVs in --log-dir if
+    # set, otherwise a tempfile keyed off launch time. Only computed if the
+    # operator asked for --record but didn't override via --record-out.
+    if $RECORD_RUN && [[ -z "$RECORD_OUT" ]]; then
+        if [[ -n "$LOG_DIR" ]]; then
+            RECORD_OUT="$LOG_DIR/run.npz"
+        else
+            RECORD_OUT="/tmp/x2_run_$(date +%Y%m%d_%H%M%S).npz"
+        fi
+    fi
+    [[ -n "$RECORD_OUT" ]] && RECORD_OUT="$(abspath "$RECORD_OUT")"
 fi
 # onbot also needs an absolute MOTION path (so abspath sees the local file
 # before we rsync it over) -- the rsync block reads $MOTION as a local path.
@@ -1057,12 +1134,71 @@ ROS2_ARGS=("--model" "$MODEL")
 [[ -n "$TILT_COS" ]]          && ROS2_ARGS+=("--tilt-cos" "$TILT_COS")
 [[ -n "$RAMP_SECONDS" ]]      && ROS2_ARGS+=("--ramp-seconds" "$RAMP_SECONDS")
 [[ -n "$MAX_TARGET_DEV" ]]    && ROS2_ARGS+=("--max-target-dev" "$MAX_TARGET_DEV")
+[[ -n "$TARGET_LPF_HZ" ]]     && ROS2_ARGS+=("--target-lpf-hz" "$TARGET_LPF_HZ")
 [[ -n "$ACTION_CLIP" ]]       && ROS2_ARGS+=("--action-clip" "$ACTION_CLIP")
 [[ -n "$RETURN_SECONDS" ]]    && ROS2_ARGS+=("--return-seconds" "$RETURN_SECONDS")
 [[ -n "$IMU_TOPIC" ]]         && ROS2_ARGS+=("--imu-topic" "$IMU_TOPIC")
 [[ -n "$INTRA_OP_THREADS" ]]  && ROS2_ARGS+=("--intra-op-threads" "$INTRA_OP_THREADS")
 [[ -n "$OBS_DUMP" ]]          && ROS2_ARGS+=("--obs-dump" "$OBS_DUMP")
 $DRY_RUN                      && ROS2_ARGS+=("--dry-run")
+
+# ---------------------------------------------------------------------------
+# Real-deploy tuning preset expansion (--tuning-config PATH.yaml).
+#
+# Sim profiles must NEVER load a tuning config: doing so would silently
+# perturb the C++<->Python parity surface that eval_x2_mujoco.py establishes
+# in MuJoCo. We hard-reject here with a friendly pointer to explicit CLI
+# flags (which the operator can use if they really want to test a preset's
+# effect in sim, knowing parity will diverge).
+#
+# In real-robot modes (local/onbot), the YAML keys are translated into
+# deploy-binary flags by gear_sonic_deploy/scripts/tuning_config_to_args.py
+# and PREPENDED to ROS2_ARGS (after the required --model). The deploy
+# binary's CLI parser is last-write-wins on duplicate flags, so explicit
+# --max-target-dev / --target-lpf-hz / etc. on this command line always
+# override the preset. That ordering is intentional: it lets you do quick
+# A/B sweeps off a known-good preset without copying the YAML.
+# ---------------------------------------------------------------------------
+if [[ -n "$TUNING_CONFIG" ]]; then
+    if [[ "$MODE" == "sim" ]]; then
+        echo -e "${RED}ERROR: --tuning-config is rejected in sim mode.${NC}" >&2
+        echo -e "${RED}       Real-deploy tuning presets exist to mitigate real-robot${NC}" >&2
+        echo -e "${RED}       sensor noise / hardware quirks. Loading them in sim would${NC}" >&2
+        echo -e "${RED}       diverge from gear_sonic/scripts/eval_x2_mujoco.py and break${NC}" >&2
+        echo -e "${RED}       the C++<->Python parity check (compare_deploy_vs_python_obs.py).${NC}" >&2
+        echo -e "${YELLOW}       If you really want to test the preset's knobs in sim, copy${NC}" >&2
+        echo -e "${YELLOW}       its values to explicit CLI flags (--max-target-dev,${NC}" >&2
+        echo -e "${YELLOW}       --target-lpf-hz, ...) and accept that parity will diverge.${NC}" >&2
+        exit 1
+    fi
+    TUNING_CONFIG="$(abspath "$TUNING_CONFIG")"
+    if [[ ! -f "$TUNING_CONFIG" ]]; then
+        echo -e "${RED}ERROR: --tuning-config file not found: $TUNING_CONFIG${NC}" >&2
+        echo -e "${YELLOW}       Available presets:${NC}" >&2
+        ls "$SCRIPT_DIR/configs/real_deploy_tuning/"*.yaml 2>/dev/null \
+            | sed "s|^|         |" >&2
+        exit 1
+    fi
+    TUNING_TRANSLATOR="$SCRIPT_DIR/scripts/tuning_config_to_args.py"
+    if [[ ! -f "$TUNING_TRANSLATOR" ]]; then
+        echo -e "${RED}ERROR: tuning translator missing: $TUNING_TRANSLATOR${NC}" >&2
+        exit 1
+    fi
+    if ! mapfile -t TUNING_ARGS < <(python3 "$TUNING_TRANSLATOR" "$TUNING_CONFIG"); then
+        echo -e "${RED}ERROR: failed to parse tuning config $TUNING_CONFIG${NC}" >&2
+        exit 1
+    fi
+    if [[ ${#TUNING_ARGS[@]} -gt 0 ]]; then
+        # Prepend the tuning args after the mandatory --model so explicit
+        # CLI flags (already in ROS2_ARGS) take precedence (last-write-wins
+        # in the C++ ParseCli loop).
+        ROS2_ARGS=("${ROS2_ARGS[0]}" "${ROS2_ARGS[1]}" \
+                   "${TUNING_ARGS[@]}" \
+                   "${ROS2_ARGS[@]:2}")
+        echo -e "${GREEN}[tuning]${NC} loaded $(basename "$TUNING_CONFIG"): " \
+                "${TUNING_ARGS[*]}"
+    fi
+fi
 
 # ============================================================================
 # MC (Motion Control) HTTP helpers + cleanup trap
@@ -1101,11 +1237,71 @@ PY
     fi
 }
 
+start_run_recorder() {
+    # Background the npz recorder. Called from the launch step (before the
+    # mode branching) so the recording covers WAIT -> CONTROL -> RAMP_OUT.
+    # Safe to call unconditionally -- no-op when --record wasn't passed.
+    if ! $RECORD_RUN; then return 0; fi
+    local recorder="$SCRIPT_DIR/scripts/x2_record_real_run.py"
+    if [[ ! -f "$recorder" ]]; then
+        echo -e "${YELLOW}[record] $recorder not found; skipping --record${NC}" >&2
+        return 0
+    fi
+    mkdir -p "$(dirname "$RECORD_OUT")"
+    echo -e "${BLUE}[record]${NC} backgrounding recorder -> $RECORD_OUT"
+    # --quiet keeps the 1 Hz status line out of the deploy's terminal output.
+    # Use scripts/x2_record_real_run.py --summarize PATH.npz after the run
+    # to pull the analysis. Inheriting our shell's ROS env (sourced by the
+    # docker auto-relaunch) means the recorder lands on the same domain as
+    # the deploy with no extra setup.
+    python3 "$recorder" \
+        --out "$RECORD_OUT" \
+        --note "deploy_x2.sh $MODE @ $(date -Iseconds)" \
+        --quiet &
+    RUN_RECORD_PID=$!
+    sleep 0.5
+    if ! kill -0 "$RUN_RECORD_PID" 2>/dev/null; then
+        echo -e "${YELLOW}[record] recorder exited immediately; check rclpy/aimdk_msgs${NC}" >&2
+        RUN_RECORD_PID=""
+    fi
+}
+
+stop_run_recorder() {
+    [[ -z "$RUN_RECORD_PID" ]] && return 0
+    if kill -0 "$RUN_RECORD_PID" 2>/dev/null; then
+        echo -e "${BLUE}[cleanup]${NC} stopping run recorder (pid $RUN_RECORD_PID) ..."
+        kill -INT "$RUN_RECORD_PID" 2>/dev/null || true
+        wait "$RUN_RECORD_PID" 2>/dev/null || true
+        echo -e "${GREEN}[cleanup]${NC} recorder finalized: $RECORD_OUT"
+    fi
+    RUN_RECORD_PID=""
+}
+
+cleanup_sim() {
+    local rc=$?
+    if [[ -n "$SIM_BRIDGE_PID" ]] && kill -0 "$SIM_BRIDGE_PID" 2>/dev/null; then
+        echo ""
+        echo -e "${BLUE}[cleanup]${NC} stopping MuJoCo bridge (pid $SIM_BRIDGE_PID) ..."
+        kill -INT "$SIM_BRIDGE_PID" 2>/dev/null || true
+        wait "$SIM_BRIDGE_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$SIM_RECORD_PID" ]] && kill -0 "$SIM_RECORD_PID" 2>/dev/null; then
+        echo -e "${BLUE}[cleanup]${NC} stopping command bag recorder (pid $SIM_RECORD_PID) ..."
+        kill -INT "$SIM_RECORD_PID" 2>/dev/null || true
+        wait "$SIM_RECORD_PID" 2>/dev/null || true
+    fi
+    stop_run_recorder
+    exit $rc
+}
+
 restart_mc_on_exit() {
     # Always called via the trap once we've stopped MC. Idempotent + safe to
     # call multiple times. Preserves the original exit code so a failing
     # deploy run still surfaces its non-zero status to the caller / CI.
     local rc=$?
+    # Stop the run recorder FIRST so it captures the deploy's RAMP_OUT and
+    # the silence between deploy-exit and MC-restart in the same npz.
+    stop_run_recorder
     if $MC_STOPPED_BY_US; then
         # Mark first so a second SIGINT doesn't double-fire.
         MC_STOPPED_BY_US=false
@@ -1456,6 +1652,8 @@ elif [[ -n "$MOTION" ]]; then
     echo -e "  Motion:             ${GREEN}$MOTION${NC}"
 fi
 [[ -n "$LOG_DIR" ]]     && echo -e "  Log dir:            ${GREEN}$LOG_DIR${NC}"
+$RECORD_RUN             && echo -e "  Record run npz:     ${GREEN}$RECORD_OUT${NC}"
+[[ -n "$TUNING_CONFIG" ]] && echo -e "  Tuning preset:      ${GREEN}$(basename "$TUNING_CONFIG")${NC}"
 [[ -n "$AUTOSTART" ]]   && echo -e "  Autostart (s):      ${GREEN}$AUTOSTART${NC}"
 [[ -n "$MAX_DURATION" ]] && echo -e "  Max duration (s):   ${GREEN}$MAX_DURATION${NC}"
 [[ -n "$TILT_COS" ]]    && echo -e "  Tilt cos thresh:    ${GREEN}$TILT_COS${NC}"
@@ -1555,21 +1753,13 @@ echo ""
 echo -e "${GREEN}🚀 Launching ...${NC}"
 echo ""
 
-cleanup_sim() {
-    local rc=$?
-    if [[ -n "$SIM_BRIDGE_PID" ]] && kill -0 "$SIM_BRIDGE_PID" 2>/dev/null; then
-        echo ""
-        echo -e "${BLUE}[cleanup]${NC} stopping MuJoCo bridge (pid $SIM_BRIDGE_PID) ..."
-        kill -INT "$SIM_BRIDGE_PID" 2>/dev/null || true
-        wait "$SIM_BRIDGE_PID" 2>/dev/null || true
-    fi
-    if [[ -n "$SIM_RECORD_PID" ]] && kill -0 "$SIM_RECORD_PID" 2>/dev/null; then
-        echo -e "${BLUE}[cleanup]${NC} stopping command bag recorder (pid $SIM_RECORD_PID) ..."
-        kill -INT "$SIM_RECORD_PID" 2>/dev/null || true
-        wait "$SIM_RECORD_PID" 2>/dev/null || true
-    fi
-    exit $rc
-}
+# --record: spin the npz recorder up BEFORE the deploy / bridge so the
+# recording covers the full WAIT -> CONTROL -> RAMP_OUT window. The cleanup
+# traps below (cleanup_sim for sim mode, restart_mc_on_exit for local/onbot)
+# both call stop_run_recorder so a clean .npz is dumped even on Ctrl-C.
+# In sim mode the bridge starts further down and the recorder picks up its
+# /aima publishers as soon as they appear -- no need to interleave starts.
+start_run_recorder
 
 if [[ "$MODE" == "onbot" ]]; then
     REMOTE_CMD="source /opt/ros/humble/setup.bash && \
@@ -1585,6 +1775,12 @@ elif [[ "$MODE" == "sim" ]]; then
     if [[ -f install/setup.bash ]]; then
         source install/setup.bash
     fi
+
+    # Install the cleanup trap NOW (before the bridge launches) so the
+    # already-running --record recorder is reaped on Ctrl-C in the gap
+    # between recorder start and bridge start. cleanup_sim no-ops on an
+    # empty SIM_BRIDGE_PID, so installing it early is safe.
+    trap cleanup_sim INT TERM EXIT
 
     # Background the MuJoCo bridge first so it's ready before the deploy
     # starts polling /aima topics.
@@ -1607,7 +1803,7 @@ elif [[ "$MODE" == "sim" ]]; then
     echo -e "${BLUE}[sim]${NC} backgrounding: $SIM_PYTHON $SIM_BRIDGE_REL ${BRIDGE_ARGS[*]}"
     "$SIM_PYTHON" "$SCRIPT_DIR/$SIM_BRIDGE_REL" "${BRIDGE_ARGS[@]}" &
     SIM_BRIDGE_PID=$!
-    trap cleanup_sim INT TERM EXIT
+    # cleanup_sim trap was installed above (before bridge launch).
 
     if [[ -n "$SIM_RECORD_COMMANDS" ]]; then
         echo -e "${BLUE}[sim]${NC} backgrounding: ros2 bag record -> $SIM_RECORD_COMMANDS"

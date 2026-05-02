@@ -125,6 +125,20 @@ struct CliArgs {
   // active, so we drive the joints back instead of letting them flop. Set
   // to <=0 to keep the legacy "shutdown immediately" behaviour.
   double      return_seconds    = 2.0;
+  // Output-side first-order EMA on the published joint targets, applied
+  // AFTER the policy has produced action_il and AFTER the safety stack has
+  // computed sc.target_pos_mj. Purely a real-deploy jitter mitigation; the
+  // policy still SEES the same observation it always has, so:
+  //   * --obs-dump emits raw policy outputs (this LPF runs after the dump
+  //     return path), keeping compare_deploy_vs_python_obs.py bit-exact;
+  //   * sim profiles in deploy_x2.sh leave this at 0 (= bypass) so MuJoCo
+  //     parity (eval_x2_mujoco.py) is preserved by construction;
+  //   * RAMP_OUT and SAFE_HOLD bypass the LPF -- those states already
+  //     produce a deliberate trajectory we don't want to attenuate.
+  // alpha = 1 - exp(-2*pi*hz*dt) at the 50 Hz OnControl rate, so e.g.
+  // hz=8 -> alpha~=0.63 (~5 Hz effective bandwidth). 0 = disabled.
+  // Documented under gear_sonic_deploy/configs/real_deploy_tuning/.
+  double      target_lpf_hz     = 0.0;
   int         intra_op_threads  = 1;
   // Optional topic overrides. Empty string -> use AimdkIo defaults
   // (which match the canonical names in the SDK `topics_and_services`
@@ -173,6 +187,15 @@ void PrintUsage()
       << "                             shutdown -- prevents MC from snapping joints\n"
       << "                             back at handoff (red-fault on X2 Ultra).\n"
       << "                             Set 0 to disable (legacy immediate-shutdown).\n"
+      << "  --target-lpf-hz HZ         REAL-DEPLOY ONLY: first-order EMA cutoff\n"
+      << "                             applied to the published joint targets to\n"
+      << "                             tame leg/waist jitter caused by noisy real\n"
+      << "                             sensor obs. Bypassed in RAMP_OUT/SAFE_HOLD.\n"
+      << "                             Default 0 (disabled). Sim parity profiles\n"
+      << "                             MUST leave this at 0 -- the LPF is invisible\n"
+      << "                             to --obs-dump (raw target preserved) but it\n"
+      << "                             changes what the bus sees, which would\n"
+      << "                             diverge from eval_x2_mujoco.py's reference.\n"
       << "  --log-dir PATH             write per-tick CSVs to PATH\n"
       << "  --intra-op-threads N       ONNX session threads (default 1)\n"
       << "  --imu-topic NAME           override IMU topic (default /aima/hal/imu/torso/state;\n"
@@ -210,6 +233,7 @@ CliArgs ParseCli(int argc, char** argv)
     else if (s == "--max-target-dev")    a.max_target_dev    = std::stod(next("--max-target-dev"));
     else if (s == "--action-clip")       a.action_clip       = std::stod(next("--action-clip"));
     else if (s == "--return-seconds")    a.return_seconds    = std::stod(next("--return-seconds"));
+    else if (s == "--target-lpf-hz")     a.target_lpf_hz     = std::stod(next("--target-lpf-hz"));
     else if (s == "--intra-op-threads")  a.intra_op_threads  = std::stoi(next("--intra-op-threads"));
     else if (s == "--imu-topic")         a.imu_topic         = next("--imu-topic");
     else if (s == "--obs-dump")          a.obs_dump_path     = next("--obs-dump");
@@ -312,6 +336,25 @@ class X2Deploy {
                   "Deploy will shut down immediately on --max-duration; if the "
                   "policy left joints far from default_angles, the next MC "
                   "start_app POST may snap them back and trip a red fault.");
+    }
+
+    // Compute the EMA coefficient now so OnControl can apply it without
+    // re-deriving every tick. dt is fixed at 1/50 s (the OnControl rate);
+    // alpha = 1 - exp(-2*pi*hz*dt) is the standard discrete first-order
+    // low-pass coefficient. hz<=0 -> alpha=0 (bypass).
+    if (cli_.target_lpf_hz > 0.0) {
+      const double dt = 1.0 / 50.0;
+      const double pi = 3.14159265358979323846;
+      target_lpf_alpha_ = 1.0 - std::exp(-2.0 * pi * cli_.target_lpf_hz * dt);
+      RCLCPP_WARN(node_->get_logger(),
+                  "REAL-DEPLOY: output target LPF ENABLED (--target-lpf-hz %.2f Hz, "
+                  "alpha=%.3f at 50 Hz OnControl). Bypassed in RAMP_OUT/SAFE_HOLD. "
+                  "Sim parity (eval_x2_mujoco.py) is preserved -- this filter "
+                  "lives strictly downstream of the policy and never affects "
+                  "--obs-dump output.",
+                  cli_.target_lpf_hz, target_lpf_alpha_);
+    } else {
+      target_lpf_alpha_ = 0.0;
     }
 
     // Initial safe command: PASSIVE (kp=0, kd=0) until any state arrives.
@@ -675,6 +718,34 @@ class X2Deploy {
                                       ramp_, watchdog_, cli_.dry_run, now,
                                       cli_.max_target_dev);
 
+    // ---- Output-side target LPF (real-deploy only; bypassed by default) ----
+    // The EMA runs strictly AFTER the safety stack, so:
+    //   * --max-target-dev clamps still bound the PRE-filter target, and the
+    //     filter then attenuates further (cannot make the published target
+    //     exceed the clamp);
+    //   * --obs-dump returned earlier in this tick (line ~672 above) before
+    //     `target_pos_mj` was even computed, so the dumped raw policy output
+    //     is identical with or without --target-lpf-hz set;
+    //   * RAMP_OUT and SAFE_HOLD bypass: those states already produce a
+    //     deliberately-shaped trajectory we don't want to attenuate.
+    if (target_lpf_alpha_ > 0.0
+        && state_.load() == State::CONTROL
+        && !sc.tilt_trip) {
+      if (!target_lpf_initialized_) {
+        // First CONTROL tick: seed the EMA state to the current target so
+        // we don't bias toward zero or any prior value.
+        target_lpf_state_ = sc.target_pos_mj;
+        target_lpf_initialized_ = true;
+      } else {
+        const double a = target_lpf_alpha_;
+        for (std::size_t i = 0; i < NUM_DOFS; ++i) {
+          target_lpf_state_[i] =
+              a * sc.target_pos_mj[i] + (1.0 - a) * target_lpf_state_[i];
+        }
+        sc.target_pos_mj = target_lpf_state_;
+      }
+    }
+
     if (sc.tilt_trip && state_.load() == State::CONTROL) {
       RCLCPP_FATAL(node_->get_logger(), "%s -> SAFE_HOLD", sc.reason.c_str());
       // Latch the safety command so the writer keeps holding it forever.
@@ -805,6 +876,17 @@ class X2Deploy {
   // ramp_out_start_pos_ -> default_angles over cli_.return_seconds.
   double                            ramp_out_entry_s_    = -1.0;
   std::array<double, NUM_DOFS>      ramp_out_start_pos_{};
+
+  // Output-side target LPF state. target_lpf_alpha_ is computed once in
+  // Run() from cli_.target_lpf_hz at the OnControl rate (50 Hz). When alpha
+  // is zero the filter is fully bypassed -- no math, no allocations, and
+  // the published target is the unmodified safety-clamped policy output.
+  // target_lpf_initialized_ is reset implicitly by being default-false at
+  // node startup; we also re-seed on the FIRST CONTROL tick (see OnControl)
+  // so post-RAMP_OUT/SAFE_HOLD restarts (if we ever support them) behave.
+  double                            target_lpf_alpha_         = 0.0;
+  bool                              target_lpf_initialized_   = false;
+  std::array<double, NUM_DOFS>      target_lpf_state_{};
 
   // Cumulative count of ticks where at least one joint hit the
   // ``--action-clip`` symmetric limit, plus the largest |action_il| we've
