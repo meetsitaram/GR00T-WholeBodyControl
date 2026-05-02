@@ -336,6 +336,26 @@ def main():
         help="Headless mode: no MuJoCo viewer, no real-time pacing. Pair with "
         "--total-sim-seconds for a deterministic CI-style parity check.",
     )
+    parser.add_argument(
+        "--obs-dump",
+        default=None,
+        help=(
+            "DEBUG: write the very first inference payload to PATH in the "
+            "X2OBSV01 binary format used by the C++ deploy's --obs-dump (see "
+            "x2_deploy_onnx_ref.cpp::DumpObsBlob and "
+            "compare_deploy_vs_isaaclab_obs.py). Layout per line: "
+            "magic[8]=X2OBSV01, tok_dim=u32(680), prop_dim=u32(990), "
+            "action_dim=u32(31), policy_time=f64, tokenizer_obs[680]=f32, "
+            "proprioception[990]=f32, action_il[31]=f64, joint_pos_mj[31]=f64, "
+            "joint_vel_mj[31]=f64, base_quat_wxyz[4]=f64, base_ang_vel[3]=f64. "
+            "Dumps tick 0 only, then exits the process so the comparator can "
+            "run against a deterministic state. Use to diff against the C++ "
+            "deploy's first-tick obs blob: any per-slot Δ in state-invariant "
+            "slots (last_action, motion_anchor terms) is a smoking gun for "
+            "an obs-construction divergence between Python eval and C++ "
+            "deploy."
+        ),
+    )
     args = parser.parse_args()
 
     print(f"Loading ONNX session from {args.onnx} ...", flush=True)
@@ -447,6 +467,44 @@ def main():
 
         # ONNX action (always computed).
         action_il_onnx = onnx_actor(proprioception, tokenizer_obs)
+
+        # ---- one-shot first-tick obs dump ----------------------------------
+        # Mirror the C++ deploy's DumpObsBlob layout exactly so the same
+        # comparator (compare_deploy_vs_isaaclab_obs.py, or a thin C++-vs-
+        # Python differ) can read both blobs. Dump on the very first tick
+        # only, then exit the process. The state captured here is bit-for-
+        # bit what the ONNX session sees at t=0 of the rollout, after RSI
+        # and the first prop_buf.append. Any divergence vs the C++ blob
+        # captured at the same point is the obs-pipeline drift bug.
+        if args.obs_dump is not None and step_count == 0:
+            import struct
+            base_quat_wxyz = mj_data.qpos[3:7].astype(np.float64)
+            base_ang_vel_w = mj_data.qvel[3:6].astype(np.float64)
+            joint_pos_mj = mj_data.qpos[7 : 7 + NUM_DOFS].astype(np.float64)
+            joint_vel_mj = mj_data.qvel[6 : 6 + NUM_DOFS].astype(np.float64)
+            # policy_time semantics in C++: seconds since CONTROL entry.
+            # Python eval has no WAIT phase, so tick 0 is policy_time = 0.
+            policy_time = 0.0
+            dump_path = Path(args.obs_dump)
+            dump_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(dump_path, "wb") as fh:
+                fh.write(struct.pack("<8sIIId",
+                    b"X2OBSV01",
+                    int(tokenizer_obs.shape[0]),
+                    int(proprioception.shape[0]),
+                    int(action_il_onnx.shape[0]),
+                    float(policy_time)))
+                fh.write(tokenizer_obs.astype(np.float32).tobytes())
+                fh.write(proprioception.astype(np.float32).tobytes())
+                fh.write(action_il_onnx.astype(np.float64).tobytes())
+                fh.write(joint_pos_mj.tobytes())
+                fh.write(joint_vel_mj.tobytes())
+                fh.write(base_quat_wxyz.tobytes())
+                fh.write(base_ang_vel_w.tobytes())
+            print(f"[obs-dump] wrote first-tick obs to {dump_path} "
+                  f"({dump_path.stat().st_size} bytes); exiting.", flush=True)
+            sys.exit(0)
+        # --------------------------------------------------------------------
 
         # Optional .pt action and parity logging.
         action_il_pt = None

@@ -50,45 +50,68 @@ actor_obs:
       - { name: gravity_dir,    dim_per_frame: 3,  history_len: 10, total: 30,  joint_order: n/a, source: quat_rotate_inverse(base_quat, [0,0,-1]) }
 
   # ---------------------------------------------------------------------------
-  # 680-D tokenizer slice -- PER-FRAME INTERLEAVED layout (matches PT
-  # training, the IsaacLab encoder_input_for_mlp_view, and the bit-perfect
-  # ONNX re-export by gear_sonic/scripts/reexport_x2_g1_onnx.py).
+  # 680-D tokenizer slice -- IsaacLab's "buggy temporal-axis reshape" layout.
+  # The PPO-trained policy expects this exact scramble; see
+  # gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/include/tokenizer_obs.hpp
+  # for the full bug history and rationale.
   #
-  # Each of the 10 future frames contributes one 68-float block:
-  #   bytes [k*68      .. k*68 + 31)  = jpos_fk_il (31)
-  #   bytes [k*68 + 31 .. k*68 + 62)  = jvel_fk_il (31)
-  #   bytes [k*68 + 62 .. k*68 + 68)  = rot6d(cur^-1 * future_k_root_quat) (6)
+  # Concretely, the encoder input is built as
+  #   command_multi_future_nonflat (N, 10, 62)  # buggy reshape, see below
+  #   motion_anchor_ori_b_mf_nonflat (N, 10, 6)
+  #   encoder_in = cat(.., dim=-1).reshape(-1)  # (680,) row-major
   #
-  # The 6D rotation rep is the COLUMNS-flat form (matches IsaacLab's
-  # ``mat[..., :2].reshape(B, -1)``). For a rotation matrix M the flattened
-  # block is [M[0,0], M[0,1], M[1,0], M[1,1], M[2,0], M[2,1]] -- NOT the
-  # rows-flat form [M[0,0], M[0,1], M[0,2], M[1,0], M[1,1], M[1,2]] that an
-  # earlier C++ implementation used. See math_utils.hpp::rot6d_from_quat_xyzw
-  # for the bug history.
+  # where command_multi_future_nonflat is built by
+  # gear_sonic/envs/manager_env/mdp/observations.py:584-585 as
+  #   cat([joint_pos_multi_future, joint_vel_multi_future], dim=1)  # (N, 620)
+  #   .reshape(N, num_future_frames=10, -1)
   #
-  # Bug history: prior to the bit-perfect ONNX re-export the deploy used the
-  # "grouped" layout [all_cmd(620) | all_ori(60)] because the *old* (broken)
-  # ONNX was exported via inference_helpers.py::UniversalTokenWrapper which
-  # sliced ``obs[:, :620]`` as cmd and ``obs[:, 620:680]`` as ori. After the
-  # re-export the ONNX consumes the same per-frame interleaved layout that
-  # the trained MLP saw, so the C++ tokenizer was switched to interleaved
-  # (gear_sonic_deploy/scripts/compare_deploy_vs_isaaclab_obs.py spots a
-  # mismatch within milliseconds on the first CONTROL tick).
+  # but the underlying buffer is [all_jpos(310) | all_jvel(310)], so the
+  # reshape produces row k of length 62 = (jpos pair) for k<5 and (jvel pair)
+  # for k>=5, NOT per-frame [jpos_fk, jvel_fk]. The deploy must reproduce
+  # this scramble bit-for-bit:
+  #
+  #   for k in 0..9 (each row = 68 floats, flattened row-major to 680):
+  #     k <  5:  bytes[k*68 ..   k*68+31)  = jpos_il at future-frame (2k)
+  #              bytes[k*68+31 .. k*68+62) = jpos_il at future-frame (2k+1)
+  #     k >= 5:  bytes[k*68 ..   k*68+31)  = jvel_il at future-frame (2*(k-5))
+  #              bytes[k*68+31 .. k*68+62) = jvel_il at future-frame (2*(k-5)+1)
+  #     bytes[k*68 + 62 .. k*68 + 68)      = rot6d(cur^-1 * future_k_root_quat)
+  #
+  # The 6D rotation rep is the row-major flatten of the first two COLUMNS of
+  # the rotation matrix, matching IsaacLab's `mat[..., :2].reshape(B, -1)`:
+  # [m00, m01, m10, m11, m20, m21]. See math_utils.hpp::rot6d_from_quat_xyzw
+  # for the rows-vs-columns bug history.
+  #
+  # Bug history: an earlier C++ revision used "true" per-frame interleaved
+  # rows [jpos_fk(31) | jvel_fk(31) | ori_fk(6)] because the bit-perfect
+  # ONNX re-export's `view(-1, 10, 68)` was misread as evidence that the
+  # input flat order was per-frame interleaved. In fact the input flat
+  # comes from IsaacLab's buggy reshape above. The mismatch made the
+  # parity sim fall after ~5 s of clean stand on the iter-4000 checkpoint
+  # while the Python eval (which faithfully reproduces the buggy reshape)
+  # held 30 s clean -- caught by the slot diff in
+  # gear_sonic_deploy/scripts/compare_deploy_vs_python_obs.py.
   # ---------------------------------------------------------------------------
   tokenizer:
     total_dim: 680
-    onnx_layout: per_frame_interleaved
+    onnx_layout: isaaclab_buggy_temporal_reshape
     components:
       - name: jpos
         dim_per_frame: 31
         num_frames: 10
-        offset_within_frame: 0     # bytes [k*68 .. k*68 + 31)
+        layout_note: |
+          jpos data lives in rows 0..4 of the (10, 68) view. Row k has
+          jpos at future-frame (2k) in slots 0..30 and jpos at future-frame
+          (2k+1) in slots 31..61. Rows 5..9 contain jvel data instead.
         joint_order: il
         source: reference_motion at t + k * dt_future_ref
       - name: jvel
         dim_per_frame: 31
         num_frames: 10
-        offset_within_frame: 31    # bytes [k*68 + 31 .. k*68 + 62)
+        layout_note: |
+          jvel data lives in rows 5..9. Row k (k>=5) has jvel at future-
+          frame (2*(k-5)) in slots 0..30 and jvel at future-frame
+          (2*(k-5)+1) in slots 31..61.
         joint_order: il
         source: reference_motion at t + k * dt_future_ref
       - name: orientation_6d_cols

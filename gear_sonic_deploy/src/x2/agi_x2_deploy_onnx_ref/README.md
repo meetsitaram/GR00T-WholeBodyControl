@@ -169,7 +169,7 @@ include/
 ├── math_utils.hpp            # quat_rotate_inverse, rot6d_from_quat_xyzw, ...
 ├── reference_motion.hpp      # StandStillReference + PklMotionReference
 ├── proprioception_buffer.hpp # 990-D IsaacLab CircularBuffer port
-├── tokenizer_obs.hpp         # 680-D ONNX grouped-layout builder
+├── tokenizer_obs.hpp         # 680-D ONNX builder (IL buggy-reshape layout)
 ├── onnx_actor.hpp            # ORT session wrapper
 ├── aimdk_io.hpp              # ROS 2 subscribers/publishers
 ├── safety.hpp                # SoftStartRamp + TiltWatchdog + ApplySafetyStack

@@ -32,6 +32,20 @@ and CLI reference see
   gap**. Mismatch in the sim-sim loop is the most likely upstream
   cause of "policy clips at 20 in IsaacLab too" and "deploy is
   numerically stable but visually unresponsive".
+- **2026-05-02 update.** Sim-sim parity gap on the C++ deploy side is
+  now closed. Two bridge-level bugs were the dominant residual after
+  G20 / G21:
+  - **G22**: `OnWriter` (500 Hz) was publishing a default-zero
+    `latest_cmd_` the moment the FSM hit `CONTROL`, prematurely
+    cancelling the bridge's pre-handoff freeze and corrupting the
+    first-tick obs by ~15 ms of zero-PD physics evolution.
+  - **G23**: bridge IMU was reading `mj_objectVelocity(local).ang`
+    instead of `qvel[3:6]`, drifting `base_ang_vel` by 0.02 rad/s.
+  After both fixes, `--sim-profile parity` first-tick obs is
+  bit-exact against `eval_x2_mujoco_onnx.py --obs-dump`
+  (`joint_pos_mj` / `joint_vel_mj` / `tokenizer_obs` / `base_ang_vel`
+  all max\|Δ\| = 0.0) and the robot stands cleanly through the 30 s
+  gate. See {doc}`sim2sim_mujoco` G22 / G23 for the full write-up.
 
 ---
 

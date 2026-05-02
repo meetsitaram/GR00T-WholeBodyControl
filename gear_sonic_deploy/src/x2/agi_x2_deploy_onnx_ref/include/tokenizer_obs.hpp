@@ -1,39 +1,55 @@
 /**
  * @file tokenizer_obs.hpp
- * @brief 680-D tokenizer observation builder, per-frame interleaved layout.
+ * @brief 680-D tokenizer observation builder. Layout deliberately mirrors a
+ *        documented bug in IsaacLab's `command_multi_future_nonflat` so the
+ *        deploy fed an observation that's bit-identical to what the trained
+ *        policy saw during PPO.
  *
- * Mirrors what the trained PyTorch encoder MLP saw in IsaacLab (see
- * gear_sonic/scripts/dump_isaaclab_step0.py::encoder_input_for_mlp_view).
- * The bit-perfect re-export at gear_sonic/scripts/reexport_x2_g1_onnx.py
- * (FusedG1Wrapper.forward) does
+ * IsaacLab builds `command_multi_future_nonflat` via
+ *   gear_sonic/envs/manager_env/mdp/observations.py:584-585
  *
- *   obs[:, : enc_dim].view(-1, 10, 68)
+ *     return command.command_multi_future.reshape(
+ *         command.num_envs, command.num_future_frames, -1)   # (N, 10, 62)
  *
- * over the per-frame catenation ``cat([command(62), ori(6)], -1)``, so the
- * deploy must emit the same per-frame interleaved 680-float layout:
+ * but `command.command_multi_future` is
+ *   `cat([joint_pos_multi_future, joint_vel_multi_future], dim=1)`
+ * with shape `(N, 2 * num_future * num_dof) == (N, 620)`, structured as
+ *   [jpos_f0(31) | jpos_f1(31) | ... | jpos_f9(31)
+ *    | jvel_f0(31) | jvel_f1(31) | ... | jvel_f9(31)]
  *
- *   for k in 0..9:
- *     [jpos_fk_il(31) | jvel_fk_il(31) | rot6d_fk(6)]      # 68 floats
+ * `reshape(N, 10, 62)` therefore does NOT produce per-frame
+ * [jpos_fk, jvel_fk] rows. It produces the "buggy" pair-then-pair pattern:
+ *   row 0: [jpos_f0(31) | jpos_f1(31)]
+ *   row 1: [jpos_f2(31) | jpos_f3(31)]    ...    row 4: [jpos_f8 | jpos_f9]
+ *   row 5: [jvel_f0(31) | jvel_f1(31)]    ...    row 9: [jvel_f8 | jvel_f9]
  *
- * Each future frame is sampled from the current ReferenceMotion at
+ * The encoder then `cat([..._nonflat, motion_anchor_ori_b_mf_nonflat], -1)`
+ * (the ori block IS per-frame), giving (N, 10, 68), and flattens row-major
+ * to 680 ints into the actor obs vector.
+ *
+ * `gear_sonic/trl/losses/token_losses.py:72-86` documents this bug and
+ * un-scrambles it on the decoder side. PPO trained the policy END-TO-END
+ * against this scrambled input, so the deploy MUST reproduce the exact
+ * scramble. A "correct" per-frame interleaved layout makes every frame
+ * look like the wrong DOFs to the policy and the robot drifts off-pose
+ * after a few seconds (caught by parity sim profile holding ~5 s before
+ * collapse).
+ *
+ * Output layout (10 rows of 68 floats, flattened row-major to 680):
+ *
+ *   row k < 5:   [jpos_f(2k)(31)     | jpos_f(2k+1)(31)     | ori_fk(6)]
+ *   row k >= 5:  [jvel_f(2(k-5))(31) | jvel_f(2(k-5)+1)(31) | ori_fk(6)]
+ *
+ * Where each future frame is sampled from the current ReferenceMotion at
  *   t_future_k = current_time + k * DT_FUTURE_REF          (k = 0..9)
- *
- * The 6-D rotation diff per frame is the first two COLUMNS of
+ * and the 6-D rotation diff per frame is `mat[:, :2].reshape(-1)` (row-major
+ * flatten of the first two columns of the rotmat) of
  *   M_k = (cur_root_quat^-1 * future_root_quat).as_matrix()
- * flattened row-major (matches IsaacLab's
- * ``mat[..., :2].reshape(B, -1)`` -- see math_utils::rot6d_from_quat_xyzw).
+ * matching IsaacLab's `motion_anchor_ori_b_mf` builder, see
+ * math_utils::rot6d_from_quat_xyzw.
  *
- * Bug history: an older revision of the deploy emitted the "grouped" form
- *   [ jpos_il_f0(31) | jvel_il_f0(31) | ... | jpos_il_f9 | jvel_il_f9     <-620
- *   | rot6d_f0(6) | ... | rot6d_f9(6) ]                                   <-60
- * because the *original* (broken) ONNX shipped at
- * ``gear_sonic_deploy/models/x2_sonic_16k.onnx`` was exported via
- * ``inference_helpers.py::UniversalTokenWrapper`` which expected that
- * layout. After the bit-perfect re-export the new ONNX expects the
- * per-frame interleaved layout shown above; the mismatch produced
- * ~1-3 rad raw policy outputs on the first CONTROL tick even on a
- * stand-still / idle motion, and was caught by the slot diff in
- * gear_sonic_deploy/scripts/compare_deploy_vs_isaaclab_obs.py.
+ * Reference (Python eval that holds 30 s on iter-4000):
+ *   gear_sonic/scripts/eval_x2_mujoco.py:620-629
  */
 
 #ifndef AGI_X2_TOKENIZER_OBS_HPP
@@ -55,7 +71,8 @@ static_assert(TOK_CMD_FLAT_DIM + TOK_ORI_FLAT_DIM == TOK_DIM,
               "tokenizer obs widths do not sum to 680");
 
 /**
- * Build the 680-D tokenizer observation in PER-FRAME INTERLEAVED layout.
+ * Build the 680-D tokenizer observation in IsaacLab's buggy
+ * pair-of-jpos-then-pair-of-jvel layout (see file-level docstring above).
  *
  * @param ref          reference-motion source (StandStill or PklMotion)
  * @param current_time seconds since CONTROL state entry (matches Sample(t)
@@ -63,19 +80,6 @@ static_assert(TOK_CMD_FLAT_DIM + TOK_ORI_FLAT_DIM == TOK_DIM,
  * @param base_quat_wxyz current robot torso orientation, MuJoCo / IMU convention
  * @return float vector of length TOK_DIM, ready to feed the ONNX session
  *         alongside the 990-D proprioception.
- *
- * The output layout is:
- *
- *   for k in 0..9: [jpos_fk_il(31) | jvel_fk_il(31) | rot6d_fk(6)]    # 68 floats
- *
- * for a total of 10 * 68 = 680 floats. This matches both the trained
- * PyTorch encoder input (encoder_input_for_mlp_view) and the bit-perfect
- * ONNX re-export (FusedG1Wrapper.forward in
- * gear_sonic/scripts/reexport_x2_g1_onnx.py).
- *
- * Feeding the OLD "grouped" ([all_cmd(620)|all_ori(60)]) layout to the new
- * ONNX produces ~1-3 rad outputs on the very first tick because the model
- * reads the 60 ori floats from what used to be the last 60 cmd floats.
  */
 std::vector<float> BuildTokenizerObs(const ReferenceMotion& ref,
                                      double current_time,

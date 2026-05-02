@@ -523,6 +523,7 @@ class X2Deploy {
           std::lock_guard<std::mutex> lk(latest_cmd_mutex_);
           latest_cmd_ = sc;
         }
+        latest_cmd_ready_.store(true, std::memory_order_release);
         logger_.Log(now, rs.joint_pos_mj, rs.joint_vel_mj,
                     rs.base_quat_wxyz, rs.base_ang_vel,
                     last_action_il_, sc);
@@ -681,6 +682,7 @@ class X2Deploy {
         std::lock_guard<std::mutex> lk(latest_cmd_mutex_);
         latest_cmd_ = sc;
       }
+      latest_cmd_ready_.store(true, std::memory_order_release);
       state_.store(State::SAFE_HOLD);
       return;
     }
@@ -690,6 +692,7 @@ class X2Deploy {
       std::lock_guard<std::mutex> lk(latest_cmd_mutex_);
       latest_cmd_ = sc;
     }
+    latest_cmd_ready_.store(true, std::memory_order_release);
 
     // ---- Log ---------------------------------------------------------------
     logger_.Log(now, rs.joint_pos_mj, rs.joint_vel_mj,
@@ -715,6 +718,17 @@ class X2Deploy {
     if (cur == State::INIT || cur == State::WAIT_FOR_CONTROL) {
       // Don't publish anything in pre-control states. The robot's last-good
       // command (from whatever was running before us) keeps the joints held.
+      return;
+    }
+    // Skip publishing until OnControl (or RAMP_OUT/SAFE_HOLD) has latched
+    // a real command. Without this guard, the first ~15 ms after WAIT ->
+    // CONTROL would publish a default-zero command (kp=0, kd=0, target=0),
+    // which on the sim bridge cancels the pre-handoff freeze prematurely
+    // and lets gravity perturb joint state before the policy ever sees it.
+    // On hardware the symptom would be different (a no-op zero-gain PD
+    // command) but it's still wrong: MC's last-good command is what should
+    // hold the joints during this sub-tick window, not our zeroed one.
+    if (!latest_cmd_ready_.load(std::memory_order_acquire)) {
       return;
     }
     SafeCommand sc;
@@ -744,6 +758,7 @@ class X2Deploy {
       std::lock_guard<std::mutex> lk(latest_cmd_mutex_);
       latest_cmd_ = sc;
     }
+    latest_cmd_ready_.store(true, std::memory_order_release);
     state_.store(State::SAFE_HOLD);
   }
 
@@ -766,6 +781,18 @@ class X2Deploy {
 
   std::mutex                        latest_cmd_mutex_;
   SafeCommand                       latest_cmd_;
+  // True once OnControl has populated latest_cmd_ at least once (or
+  // RAMP_OUT/SAFE_HOLD has explicitly latched one). Until this flips,
+  // OnWriter must NOT publish, otherwise the bridge sees a default-zero
+  // JointCommand (kp=0, kd=0, target=0), which (a) silently flips its
+  // ``_first_command_received`` flag and unfreezes physics, and (b)
+  // perturbs joint state in the ~15 ms between WAIT->CONTROL and the first
+  // OnControl tick. That produced an apples-to-oranges first-tick obs
+  // (e.g. cpp jvel[5] = -0.0077 vs python jvel[5] = -0.0265 for the same
+  // motion frame) and was the source of the parity-profile fall-at-~5 s.
+  // See gear_sonic_deploy/scripts/x2_mujoco_ros_bridge.py:_sim_step_once
+  // for the freeze counterpart on the bridge side.
+  std::atomic<bool>                 latest_cmd_ready_{false};
 
   std::atomic<State>                state_{State::INIT};
   double                            control_entry_s_     = -1.0;

@@ -230,6 +230,10 @@ vastai-dev-notes.md
 # on every smoke test, and only useful in the originating workspace.
 logs/x2/
 
+# Generic per-workstation scratch space used by debugging tools (e.g.
+# obs-dump blobs, ad-hoc captures). Never check in.
+scratch/
+
 # Standalone CMake build dir we use for the offline unit tests in
 # gear_sonic_deploy/src/x2/agi_x2_deploy_onnx_ref/. The colcon build/
 # directory is already covered by the toplevel build/ rule, but

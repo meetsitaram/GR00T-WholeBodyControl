@@ -82,6 +82,14 @@ This bites in two places:
    the angular-velocity history every step. Symptom: policy looks
    confused, drifts off balance after a stride, never recovers — but
    the same checkpoint walks fine in IsaacLab.
+3. **Sim bridge IMU publisher (corollary)** — see G23. Even with
+   the qvel slice in body frame on the *write* side, you still have
+   to publish `mj_data.qvel[3:6]` on the *read* side. The seemingly-
+   equivalent `mj_objectVelocity(BODY, pelvis_id, ang, flg_local=1)`
+   reads from `mj_data.cvel` (CoM-frame spatial velocity) and does
+   not round-trip bit-exactly to `qvel[3:6]` after a manual `qvel`
+   write + `mj_forward`. We measured a 0.02 rad/s drift; it's enough
+   to make a fresh policy fall in 5 s on the parity gate.
 
 Verification recipe: zero-gravity single-body MJCF, set `qvel[3:6]`,
 let the sim integrate one timestep, and check how `qpos[3:7]` evolves
@@ -1078,6 +1086,173 @@ See `sim2sim_ablation_study.md` §6.7 for the §6.6-equivalent bench
 re-run under the post-G21 ONNX path; the deploy artifact matches the
 PT bench within stochastic noise on every cell.
 
+### G22. Sim bridge: `OnWriter` must NOT publish before `OnControl` has run
+
+**Date discovered:** 2026-05-02, while chasing the residual sim-to-sim
+gap on `--sim-profile parity` after G21.
+
+**One-line summary.** The C++ deploy's 500 Hz `OnWriter` timer began
+publishing `latest_cmd_` the moment the FSM entered `CONTROL`, but
+`latest_cmd_` was a default-constructed `SafeCommand` (target = 0,
+kp = 0, kd = 0) until `OnControl` (50 Hz) had run for the first time.
+On the sim bridge, that all-zero command flipped
+`_first_command_received` ~15 ms early, cancelling the pre-handoff
+freeze and letting gravity perturb `qvel` *before* the policy ever
+observed the RSI state. The first-tick obs the policy saw was
+therefore **not** the bit-exact RSI state but a 15 ms-evolved
+zero-PD free-fall snapshot.
+
+**Why it was hard to see.** Every individual piece looked correct:
+
+- `_rsi_from_motion` wrote `qvel = state.joint_vel_mj` and called
+  `mj_forward` -- verified bit-exact via debug print.
+- `_publish_joint_states` re-read `mj_data.qvel[qvel_adr[i]]` and
+  pushed it on the wire -- verified bit-exact.
+- C++ `IngestJointGroup` stored `msg.joints[i].velocity` straight into
+  `latest_state_.joint_vel_mj[start + i]` -- verified bit-exact.
+
+But by the time `OnControl` ran and snapshotted `rs.joint_vel_mj`,
+`mj_step` had been integrating for three sim ticks already, because
+the bridge had unfrozen on the all-zero `OnWriter` publish. The first
+clue was that the C++ obs dump showed `policy_time = 0.02 s` (not
+`0.00 s` as Python eval) and `joint_vel_mj[5] = -0.0086` instead of
+the RSI value `-0.0265`. The ratio varied across joints
+(0.32 / 0.42 / 0.44), ruling out a simple scale factor or a
+permutation bug -- it was joint-and-contact-specific damping during
+that 15 ms window. The user's question that surfaced this --
+*"could the ros bridge add some extra noise or latency to c++ run that
+the python doesn't have to tackle?"* -- was exactly right: the bridge
+is the *only* place this can hide because Python eval has no
+inter-process FSM, no separate writer timer, and no command callback
+to flip a freeze flag against.
+
+**Fix.** Add a `std::atomic<bool> latest_cmd_ready_{false}` flag to
+`X2Deploy`. `OnWriter` returns early until it is set. Flip it in all
+four places that legitimately populate `latest_cmd_`:
+
+1. End of `OnControl` after the action has been clipped, latched, and
+   logged (the normal CONTROL-tick exit).
+2. The `tilt_trip` SAFE_HOLD branch in `OnControl`.
+3. The `RAMP_OUT` lerp branch in `OnControl`.
+4. `LatchSafeHold` (called from the fatal-error paths in `OnControl`,
+   `OnInit`, etc.).
+
+With the gate in place, the bridge stays frozen until the very first
+real CONTROL command lands, and the first-tick obs is bit-exact
+against Python eval (`joint_vel_mj` and `tokenizer_obs` max | Δ |
+went from 0.017 / 8.7 × 10⁻⁵ down to **0.000000** -- machine zero).
+
+**Lessons.**
+
+- The "freeze the bridge until first real command" handshake is only
+  half implemented unless *both* sides cooperate. A 500 Hz writer that
+  fires the moment a state machine flips to CONTROL will trample the
+  handshake even if the bridge correctly waits on it -- because the
+  writer publishes a structurally-valid (just zero-everything)
+  command, which the bridge has no way to distinguish from a real
+  one.
+- When debugging an obs-pipeline parity gap, instrument BOTH ends and
+  every point in between (RSI write → `mj_forward` → `qvel` slice →
+  message field on the wire → subscriber callback → `latest_state_`
+  field → `SnapshotState` copy → builder input) and watch the value
+  flow tick by tick. The bug was visible in 30 seconds of debug-print
+  output once we dumped the bridge's `qvel` AND the deploy's
+  `latest_state_` AND `rs` (the OnControl snapshot) together.
+- On hardware this would have been a no-op zero-gain PD command (MC's
+  last-good command holds the joints), so the bug only surfaces in
+  sim. That is the failure mode of "sim bridge that emulates the
+  hardware contract": any small deviation between sim-side and
+  hardware-side semantics for "what happens before the first real
+  command arrives" leaks into the policy obs.
+
+**Validation after the fix.** `--sim-profile parity` first-tick obs
+diff against `eval_x2_mujoco_onnx.py --obs-dump`, on
+`minimal_v1.yaml`, iter-4000 ONNX:
+
+| Field | Pre-fix max\|Δ\| | Post-fix max\|Δ\| |
+|---|---|---|
+| `joint_pos_mj`     | 6e-4   | **0.000000** |
+| `joint_vel_mj`     | 0.0169 | **0.000000** |
+| `tokenizer_obs`    | 8.7e-5 | **0.000000** |
+| `proprioception`   | 0.0174 | 0.0196 (*) |
+| `action_il`        | 0.0095 | 0.0124 (*) |
+
+(*) Residual driven by `base_ang_vel` -- see G23 below; that one
+fixed in the same commit.
+
+### G23. Sim bridge: publish `qvel[3:6]` for IMU ang-vel, NOT `mj_objectVelocity`
+
+**Date discovered:** 2026-05-02, in the same parity-debug session as
+G22, after the writer-gate fix narrowed the residual to a single
+proprioception term.
+
+**One-line summary.** The bridge's `_publish_imu` was reading angular
+velocity via
+`mj_objectVelocity(mjOBJ_BODY, pelvis_id, ang, flg_local=1)`, which
+returns the angular component of `mj_data.cvel` (spatial velocity at
+the body's CoM expressed in body frame). After a manual `qvel` write
++ `mj_forward`, that does **not** round-trip exactly to `qvel[3:6]`,
+even for the floating-base body. We measured a 0.02 rad/s
+component-wise discrepancy on the very first tick after RSI:
+
+```
+mj_objectVelocity(local).ang = -0.002126, -0.012341, -0.007229
+mj_data.qvel[3:6]            = -0.009507, +0.007227, -0.008153
+```
+
+`eval_x2_mujoco{,_onnx}.py` and IsaacLab training both read
+`qvel[3:6]` directly (the documented Gotcha G1 -- it IS the
+body-local angular velocity of the free-joint root body by MuJoCo
+convention). The bridge therefore handed the policy an OOD
+`base_ang_vel` input that drifted ~0.02 rad/s from what the policy
+was trained on, on every IMU publish.
+
+**Why it was hard to see.** G1 only covers "qvel[3:6] is body-local,
+not world" -- which the bridge already respected on the *write* side
+(G1's RSI clause). The *read* side, however, had silently used
+`mj_objectVelocity` for legacy reasons (it was the natural
+extensible API for "give me the IMU body's ang vel in body frame",
+and it would also work if someone ran the bridge with
+`--imu-from torso`). The mistake is in assuming
+`mj_objectVelocity(local).ang == qvel[3:6]` for the free-joint base
+body. It isn't, because `cvel` lives in CoM-centred body frame and is
+populated by `mj_RNE`/`mj_subtreeCoM`/etc. inside `mj_forward`, with
+its own numerical path that doesn't bit-equal a direct `qvel` slice.
+
+**Fix.** When the IMU body **is** the floating-base body (`pelvis`
+under `--imu-from pelvis`, the default), publish
+`self.mj_data.qvel[3:6]` directly. For `--imu-from torso` the
+floating-base IMU body identity doesn't hold, so fall through to the
+legacy `mj_objectVelocity` path -- the policy isn't trained on a
+torso-mounted IMU anyway. Implementation in
+`gear_sonic_deploy/scripts/x2_mujoco_ros_bridge.py::_publish_imu`,
+using `self._free_base_body_id` resolved at construction.
+
+**Validation after the fix.** Same parity dump as G22, only the
+relevant rows:
+
+| Field | Pre-fix max\|Δ\| | Post-fix max\|Δ\| |
+|---|---|---|
+| `base_ang_vel`     | 0.0196 | **0.000000** |
+| `proprioception`   | 0.0196 | **0.000000** |
+
+Visually: `--sim-profile parity` (no elastic band, ramp = 0,
+autostart = 0, RSI from `minimal_v1.yaml`) now stands cleanly through
+30 s, matching the Python eval gate.
+
+**Lessons.**
+
+- Anywhere the policy reads a `base_*` quantity, prefer the canonical
+  `qpos` / `qvel` slice over an indirection through `cvel` /
+  `mj_objectVelocity` / a sensor block, *unless* you've measured that
+  the indirection round-trips bit-exactly with the canonical slice.
+  For `qvel[3:6]` on the free-joint body, the indirection does not.
+- This belongs as a corollary to G1, not a separate concept.
+  `base_ang_vel` parity has TWO requirements: (a) RSI must write the
+  body-frame angular velocity (G1's first clause), and (b) per-step
+  read must come from `qvel[3:6]`, not `cvel`. The legacy bridge
+  satisfied (a) but not (b).
+
 ## Debugging Recipe: When IsaacLab Works but MuJoCo Doesn't
 
 1. **Dump the IsaacLab step-0 ground truth** with
@@ -1109,6 +1284,8 @@ PT bench within stochastic noise on every cell.
 | Walks fine for ~1 s then drifts | Tokenizer obs body-frame transform off (G9); motion phase clock not aligned with RSI frame (G10) |
 | **Robot turns ~180° within 1–2 s and walks the wrong way** | **6D rotation flatten ordering in `motion_anchor_ori_b_mf_nonflat` does not match training (G9 / G20)** — column-major `concatenate([col0, col1])` instead of row-major `mat[:, :2].reshape(-1)` will permute the channels and produce exactly this symptom. Verified empirically: pre-fix yaw drift hit 180° in 2 s; post-fix it stays under 10°. |
 | **PyTorch eval works, ONNX eval falls deterministically on the same RSI cell** | **Tokenizer-layout bug at the ONNX wrapper boundary (G21).** `eval_x2_mujoco_onnx.py::OnnxActor` was applying a spurious "interleaved → grouped" rearrangement on the 680-D tokenizer slice before feeding the ONNX session. Pre-fix `--compare-pt` reports 3+ rad action delta over a rollout while PT alone is faithful. Fix: remove the rearrangement; the fused g1 ONNX expects per-frame interleaved layout — same as `build_tokenizer_obs` already produces. |
+| **`eval_x2_mujoco{,_onnx}.py` walks 30 s clean but `deploy_x2.sh sim --sim-profile parity` falls in 2–5 s on the same checkpoint and the same motion** | **Sim-bridge handshake is leaking pre-control physics into the first policy obs (G22).** Bridge has a "freeze `mj_step` until first deploy command" clause; the C++ `OnWriter` (500 Hz) was firing the moment FSM hit `CONTROL` and publishing a default-zero `latest_cmd_` *before* `OnControl` had ever run, prematurely cancelling the freeze. Fix: gate `OnWriter` behind a `latest_cmd_ready_` atomic that flips only after `OnControl` (or a SAFE_HOLD / RAMP_OUT branch) populates `latest_cmd_`. Symptom-side tell: C++ obs dump's `policy_time = 0.02 s` while Python's is `0.00 s`, AND `joint_vel_mj` magnitudes are systematically smaller than Python's by a joint-specific (non-uniform) factor in the 0.3–0.5 range. |
+| **Same checkpoint and motion, sim parity dump shows everything bit-exact except `base_ang_vel` is off by ~0.02 rad/s** | **Bridge IMU was reading `mj_objectVelocity(local)` instead of `qvel[3:6]` (G23, corollary to G1).** `mj_objectVelocity` returns CoM-frame `cvel`, which after a manual `qvel` write + `mj_forward` does NOT round-trip to `qvel[3:6]` even for the free-joint base body. Fix: when IMU body == floating-base body, publish `mj_data.qvel[3:6]` directly. |
 | Same checkpoint walks in IsaacLab, fails in MuJoCo | Always start with the dump-and-compare recipe above. If proprio/tokenizer/encoder/decoder all match within tolerance, the residual is **foot collider geometry** (G18) — confirm by overriding the IsaacLab eval with `++robot.foot=sphere` and checking that the failure now reproduces inside Isaac. **Note (2026-05-01): G20 retracts the "G18 is the dominant gap" claim** — the dominant MuJoCo failure was the 6D rotation channel-order bug, not foot geometry. |
 | Robot stumbles on heel/toe contact, can't recover | Ankle PD authority — try `--kp-scale-ankle 1.5` (G16b, +0.5 s avg survival on 6k) or `--kp-scale 1.3` (broadband, equivalent gain); foot contact model gap (G11 / G13 — both tried, both negative); confirm armature is set per joint (G12) |
 | Joints feel sluggish at ankle/wrist or over-driven at hip | MJCF armature uniform / mismatched vs Isaac per-joint values (G12) |

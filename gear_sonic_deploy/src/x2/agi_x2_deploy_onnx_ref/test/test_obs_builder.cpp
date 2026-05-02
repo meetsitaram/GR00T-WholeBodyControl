@@ -256,21 +256,23 @@ void TestStandStillTokenizerSize()
   const auto tok = BuildTokenizerObs(ref, /*current_time=*/0.0, id_wxyz);
   EXPECT(tok.size() == TOK_DIM, "tokenizer size != 680");
 
-  // ONNX layout for the 680-D tokenizer slice (PER-FRAME INTERLEAVED, matches
-  // the bit-perfect re-export by reexport_x2_g1_onnx.py::FusedG1Wrapper which
-  // does ``view(-1, 10, 68)`` over ``cat([command(62), ori(6)], -1)``):
+  // ONNX layout for the 680-D tokenizer slice mirrors IsaacLab's buggy
+  // `command_multi_future_nonflat` reshape (see tokenizer_obs.hpp file
+  // header for the full bug-history rationale). Concretely, 10 rows of 68
+  // floats flattened row-major:
   //
-  //   per frame k in 0..9 (each 68-float block):
-  //     tok[k*68 + 0..30)      = jpos_fk_il(31)
-  //     tok[k*68 + 31..62)     = jvel_fk_il(31)
-  //     tok[k*68 + 62..68)     = ori_fk(6)
+  //   row k < 5:   [jpos_f(2k)(31)     | jpos_f(2k+1)(31)     | ori_fk(6)]
+  //   row k >= 5:  [jvel_f(2(k-5))(31) | jvel_f(2(k-5)+1)(31) | ori_fk(6)]
   //
-  // For a StandStillReference at any time t every jpos future frame is
+  // For a StandStillReference at any time t every jpos future frame equals
   // default_angles permuted into IL order, every jvel future frame is zero,
   // and every ori future frame (cur=identity, future=identity) is the 6D
-  // representation of identity = [1,0,0, 0,1,0] (first two columns of the
-  // identity matrix flattened row-major, see math_utils::rot6d_from_quat_xyzw
-  // for the convention).
+  // representation of identity = [1,0,0, 1,0,0] (first two columns of I3
+  // flattened row-major, see math_utils::rot6d_from_quat_xyzw).
+  //
+  // So rows 0..4 contain default_angles in BOTH halves (jpos pair), rows
+  // 5..9 contain zeros in BOTH halves (jvel pair), and every row's last 6
+  // floats are the identity rot6.
   //
   // Tolerance is 1e-6 because the tokenizer obs is float32 (the ONNX input
   // dtype) but default_angles[] is double, so we expect <= 1 ULP of float
@@ -278,19 +280,26 @@ void TestStandStillTokenizerSize()
   // float32 so use 1e-12.
 
   for (std::size_t k = 0; k < 10; ++k) {
-    const std::size_t base = k * 68;  // each frame block is 62 (cmd) + 6 (ori)
+    const std::size_t base = k * 68;  // each row is 62 (cmd) + 6 (ori)
 
-    // jpos block
-    for (std::size_t il = 0; il < NUM_DOFS; ++il) {
-      const std::size_t mj = static_cast<std::size_t>(isaaclab_to_mujoco[il]);
-      EXPECT_NEAR(static_cast<double>(tok[base + il]), default_angles[mj], 1e-6);
-    }
-    // jvel block (offset +31 within frame)
-    for (std::size_t il = 0; il < NUM_DOFS; ++il) {
-      EXPECT_NEAR(static_cast<double>(tok[base + NUM_DOFS + il]), 0.0, 1e-12);
+    if (k < 5) {
+      // Two jpos halves: each is default_angles in IL order.
+      for (std::size_t half = 0; half < 2; ++half) {
+        const std::size_t hbase = base + half * NUM_DOFS;
+        for (std::size_t il = 0; il < NUM_DOFS; ++il) {
+          const std::size_t mj = static_cast<std::size_t>(isaaclab_to_mujoco[il]);
+          EXPECT_NEAR(static_cast<double>(tok[hbase + il]),
+                      default_angles[mj], 1e-6);
+        }
+      }
+    } else {
+      // Two jvel halves: each is zero.
+      for (std::size_t i = 0; i < 2 * NUM_DOFS; ++i) {
+        EXPECT_NEAR(static_cast<double>(tok[base + i]), 0.0, 1e-12);
+      }
     }
 
-    // ori block (offset +62 within frame): identity rotation, first two
+    // ori block (offset +62 within row): identity rotation, first two
     // columns of I3 flattened row-major = [1, 0, 0, 1, 0, 0]
     const std::size_t obase = base + 62;
     EXPECT_NEAR(static_cast<double>(tok[obase + 0]), 1.0, 1e-7);

@@ -6,9 +6,10 @@
  *   - Single ONNX input  : float32 [1, 1670] = [tokenizer(680) | proprio(990)]
  *   - Single ONNX output : float32 [1, 31]   = action in IsaacLab DOF order
  *
- * The ONNX must already be in GROUPED tokenizer layout (which our
- * `BuildTokenizerObs` produces directly -- we never construct the
- * interleaved PT layout in C++).
+ * The ONNX consumes the 680-D tokenizer slice in IsaacLab's "buggy
+ * temporal-axis reshape" layout (see tokenizer_obs.hpp for the exact
+ * pair-of-jpos-then-pair-of-jvel pattern). `BuildTokenizerObs` produces
+ * that layout directly so this wrapper does no rearrangement.
  *
  * The session is created once at startup (slow), and `Infer()` may be called
  * from the realtime control timer (fast: ~0.5 ms on x86_64 CPU).
@@ -57,8 +58,8 @@ class OnnxActor {
   /**
    * Run one inference tick.
    *
-   * @param tokenizer_obs  680-D tokenizer obs in GROUPED layout (see
-   *                       BuildTokenizerObs)
+   * @param tokenizer_obs  680-D tokenizer obs in IsaacLab buggy-reshape
+   *                       layout (see BuildTokenizerObs)
    * @param proprioception 990-D proprioception in PolicyCfg term order
    * @return 31-D action in IsaacLab DOF order. Caller is responsible for
    *         applying x2_action_scale and the il->mj remap before sending

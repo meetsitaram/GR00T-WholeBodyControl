@@ -372,6 +372,17 @@ class X2MujocoRosBridge:
             print("[bridge] WARNING: --fixed-base requested but MJCF has a free joint; "
                   "ignoring (would need MJCF surgery to honour).", file=sys.stderr)
 
+        # Resolve the body that owns the free joint (i.e. the floating base).
+        # We need this to decide whether ``_publish_imu`` can short-circuit
+        # to ``qvel[3:6]`` for bit-exact ang-vel parity with Python eval --
+        # see the comment in ``_publish_imu``.
+        self._free_base_body_id = -1
+        if self.has_floating_base:
+            for jid in range(self.mj_model.njnt):
+                if self.mj_model.joint(jid).type == mujoco.mjtJoint.mjJNT_FREE:
+                    self._free_base_body_id = int(self.mj_model.jnt_bodyid[jid])
+                    break
+
         # --- IMU body ---
         if args.imu_from == "pelvis":
             self.imu_body = "pelvis"
@@ -580,16 +591,37 @@ class X2MujocoRosBridge:
         msg.orientation.x = float(wxyz[1])
         msg.orientation.y = float(wxyz[2])
         msg.orientation.z = float(wxyz[3])
-        # Angular velocity in body frame.
-        ang = np.zeros(6, dtype=np.float64)
-        mujoco.mj_objectVelocity(
-            self.mj_model, self.mj_data, mujoco.mjtObj.mjOBJ_BODY,
-            self.imu_body_id, ang, 1,  # 1 = body local frame
-        )
-        # mj_objectVelocity returns [angular(3), linear(3)] in local frame.
-        msg.angular_velocity.x = float(ang[0])
-        msg.angular_velocity.y = float(ang[1])
-        msg.angular_velocity.z = float(ang[2])
+        # ---- Angular velocity (body-local frame) ----------------------------
+        # Parity gotcha: ``mj_objectVelocity(..., flg_local=1)`` for a body
+        # returns the angular component of ``mj_data.cvel``, which is the
+        # spatial velocity computed at the body's CoM expressed in body
+        # frame. After a manual ``qvel`` write + ``mj_forward`` it does NOT
+        # round-trip exactly to ``qvel[3:6]`` -- we observed a 0.02 rad/s
+        # drift on the parity gate vs ``eval_x2_mujoco{,_onnx}.py``, and the
+        # policy reacts visibly to a 0.02 rad/s OOD ang-vel input. Both the
+        # eval scripts AND IsaacLab's training observation read
+        # ``qvel[3:6]`` directly (it is the BODY-LOCAL angular velocity of
+        # the free-joint root body by MuJoCo convention -- see Gotcha G1 in
+        # docs/source/user_guide/sim2sim_mujoco.md). To stay bit-exact with
+        # Python eval and the trained policy, publish ``qvel[3:6]`` instead
+        # of ``mj_objectVelocity`` when the IMU is on the floating-base
+        # body (the "pelvis" default). For ``--imu-from torso`` we don't
+        # have a clean qvel slice -- the policy isn't trained on a torso
+        # IMU anyway, so the legacy mj_objectVelocity path is fine there.
+        if self.imu_body_id == self._free_base_body_id:
+            qvel_ang = self.mj_data.qvel[3:6]
+            msg.angular_velocity.x = float(qvel_ang[0])
+            msg.angular_velocity.y = float(qvel_ang[1])
+            msg.angular_velocity.z = float(qvel_ang[2])
+        else:
+            ang = np.zeros(6, dtype=np.float64)
+            mujoco.mj_objectVelocity(
+                self.mj_model, self.mj_data, mujoco.mjtObj.mjOBJ_BODY,
+                self.imu_body_id, ang, 1,  # 1 = body local frame
+            )
+            msg.angular_velocity.x = float(ang[0])
+            msg.angular_velocity.y = float(ang[1])
+            msg.angular_velocity.z = float(ang[2])
         # Linear acceleration: derive from qacc projected to body frame would be
         # ideal; for now we send root linear acceleration in world frame which
         # is what an idealised IMU after gravity removal would not match. The
@@ -691,7 +723,45 @@ class X2MujocoRosBridge:
         ``mj_step`` write so the viewer's render thread can't read a
         half-mutated ``mj_data`` (segfaults out of GLFW otherwise -- this is
         the documented MuJoCo passive-viewer pattern).
+
+        Pre-handoff freeze
+        ------------------
+        Before the first deploy command arrives we DO NOT call ``mj_step``.
+        State and IMU publishers still fire on schedule (the deploy needs
+        fresh state to advance INIT -> WAIT_FOR_CONTROL -> CONTROL), but
+        the body is held bit-exact at its RSI / init-pose configuration.
+
+        Why: the deploy's INIT and (default 5 s) WAIT phases together can
+        easily last hundreds of ms before the policy sends its first
+        command. If the sim integrated the entire time, gravity, ground
+        contact, and any non-zero joint vel from the RSI'd motion frame
+        would silently evolve the body off its initial state. The deploy's
+        first-tick observation would then NOT match Python eval's
+        observation of the same frame -- making sim-to-sim parity a moving
+        target. Freezing makes the bridge match ``eval_x2_mujoco_onnx.py``
+        exactly: the policy's first inference sees the bit-exact RSI
+        state.
+
+        On hardware this is also what actually happens: HAL streams joint
+        states from MC, but joints don't physically move until the deploy
+        starts driving them. Mirroring that in sim is more honest than
+        letting the bridge run free.
+
+        The freeze breaks at the moment the bridge's command callback
+        flips ``self._first_command_received`` (see ``_make_cmd_callback``).
+        From that tick onward, mj_step runs at full rate, the elastic band
+        auto-release schedule starts ticking against ``_first_command_mono``,
+        and the sim is identical to its prior behaviour.
         """
+        if not self._first_command_received:
+            # Frozen-body publish: state stays at RSI values, the deploy
+            # gets fresh timestamps so its freshness check still clears.
+            self._sim_step_count += 1
+            if self._sim_step_count % state_period_steps == 0:
+                self._publish_joint_states()
+            if self._sim_step_count % imu_period_steps == 0:
+                self._publish_imu()
+            return
         self._apply_pd()
         self._apply_elastic_band()
         if viewer is not None:
@@ -848,7 +918,18 @@ class X2MujocoRosBridge:
             self.mj_data.qpos[0:3] = state["root_pos_w"]
             self.mj_data.qpos[3:7] = state["root_quat_w_wxyz"]
             self.mj_data.qvel[0:3] = state["root_lin_vel_w"]
-            self.mj_data.qvel[3:6] = state["root_ang_vel_w"]
+            # MuJoCo free-joint qvel convention: qvel[3:6] is BODY-LOCAL angular
+            # velocity (NOT world frame). compute_motion_state returns
+            # root_ang_vel_w in world frame, so we must rotate it into the body
+            # frame here -- mirrors gear_sonic/scripts/eval_x2_mujoco.py:799-802
+            # (_apply_init_state). Without this, the IMU's published
+            # base_ang_vel disagrees with what the Python eval observes at the
+            # same RSI state, which the policy reads as a fictitious tilt rate
+            # and corrects against -- causing the parity-profile sim to fall
+            # within ~2 s on iter-4000 even after the tokenizer layout fix.
+            self.mj_data.qvel[3:6] = self.eval_x2.quat_rotate_inverse(
+                state["root_quat_w_wxyz"], state["root_ang_vel_w"]
+            )
         for i in range(self.eval_x2.NUM_DOFS):
             self.mj_data.qpos[self.qpos_adr[i]] = float(state["joint_pos_mj"][i])
             self.mj_data.qvel[self.qvel_adr[i]] = float(state["joint_vel_mj"][i])

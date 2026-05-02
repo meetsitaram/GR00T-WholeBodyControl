@@ -107,11 +107,25 @@ ReferenceFrame PklMotionReference::Sample(double time) const
   // Looped playback. We compute joint velocity by finite differencing the
   // file (rather than storing it) so the binary format stays compact and
   // matches eval_x2_mujoco's compute_motion_state semantics.
+  //
+  // CRITICAL: use BACKWARD difference (current - previous), not forward,
+  // to match `gear_sonic/scripts/eval_x2_mujoco.py:596-598`:
+  //   prev_fi = max(0, fi - 1)
+  //   jvel_mj = (m["dof"][fi] - m["dof"][prev_fi]) * motion_fps
+  //
+  // Forward difference (next - current) gives the same magnitude on
+  // monotonic / smooth motions but lags by one frame, which shows up as
+  // ~0.1 rad/s discrepancies on first-tick obs diffs against the Python
+  // ground truth and accumulates into a few-rad offset by the time the
+  // policy needs to make a balance correction. Mismatched jvel was the
+  // residual after fixing the tokenizer layout (see tokenizer_obs.cpp
+  // bug history #4).
   const double frame_f = time * fps_;
   const auto   N       = static_cast<long long>(num_frames_);
   long long    f_idx   = static_cast<long long>(frame_f) % N;
   if (f_idx < 0) f_idx += N;          // C++ % for negative inputs
-  const long long f_next = (f_idx + 1) % N;
+  // Backward neighbour, clamped at 0 to mirror `max(0, fi - 1)` in Python.
+  const long long f_prev = (f_idx > 0) ? (f_idx - 1) : 0;
   const double    dt     = 1.0 / fps_;
 
   ReferenceFrame out;
@@ -121,7 +135,7 @@ ReferenceFrame PklMotionReference::Sample(double time) const
   // Anchor() is called on CONTROL entry. See header for rationale.
   out.root_quat_xyzw = quat_mul_xyzw(yaw_anchor_xyzw_, root_quat_xyzw_[f_idx]);
   for (std::size_t d = 0; d < NUM_DOFS; ++d) {
-    out.joint_vel_mj[d] = (jpos_mj_[f_next][d] - jpos_mj_[f_idx][d]) / dt;
+    out.joint_vel_mj[d] = (jpos_mj_[f_idx][d] - jpos_mj_[f_prev][d]) / dt;
   }
   return out;
 }
