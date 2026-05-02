@@ -314,19 +314,37 @@ class X2Deploy {
                   "start_app POST may snap them back and trip a red fault.");
     }
 
-    // Initial safe command: hold default angles with normal kp/kd. Used by
-    // the writer until the control timer produces something better.
+    // Initial safe command: PASSIVE (kp=0, kd=0) until any state arrives.
+    //
+    // The 500 Hz writer starts publishing as soon as the timer fires, which
+    // is *before* INIT clears (i.e. before any joint state has been
+    // received from HAL). If we latched full kp/kd here against
+    // default_angles, the writer would yank every joint toward
+    // default_angles for the entire pre-INIT window -- which on the real
+    // robot fights MC's standing pose, and in sim mode (with the bridge's
+    // standby PD already holding a non-default pose, e.g. --init-pose=
+    // gantry_hang) tips the body over before the policy ever gets a tick
+    // (verified: 95 deg tilt in 3 s of autostart). Publishing kp=kd=0 at
+    // startup means the writer applies zero torque, leaving HAL / MC / the
+    // sim bridge fully in charge until INIT->WAIT_FOR_CONTROL.
+    //
+    // The actual safe-hold pose is latched in OnControl() at the
+    // INIT->WAIT_FOR_CONTROL transition, using the *current* observed
+    // joint pose (rs.joint_pos_mj). That way the deploy holds whatever
+    // pose the operator/MC/bridge had at the moment of handoff, so
+    // WAIT_FOR_CONTROL is genuinely safe regardless of how far the start
+    // pose is from DEFAULT_DOF.
     {
       std::lock_guard<std::mutex> lk(latest_cmd_mutex_);
       for (std::size_t i = 0; i < NUM_DOFS; ++i) {
         latest_cmd_.target_pos_mj[i] = default_angles[i];
-        latest_cmd_.stiffness_mj[i]  = cli_.dry_run ? 0.0 : kps[i];
-        latest_cmd_.damping_mj[i]    = cli_.dry_run ? 0.0 : kds[i];
+        latest_cmd_.stiffness_mj[i]  = 0.0;
+        latest_cmd_.damping_mj[i]    = 0.0;
       }
       latest_cmd_.dry_run    = cli_.dry_run;
       latest_cmd_.tilt_trip  = false;
       latest_cmd_.ramp_alpha = 0.0;
-      latest_cmd_.reason     = "init";
+      latest_cmd_.reason     = "init_passive";
     }
 
     // Timers. Both attach to whatever executor spins this node.
@@ -375,10 +393,51 @@ class X2Deploy {
     switch (cur) {
       case State::INIT: {
         if (aimdk_io_->AllStateFresh(0.5)) {
+          // Latch the current observed joint pose as the safe-hold target
+          // *before* WAIT_FOR_CONTROL begins. The 500 Hz writer will keep
+          // publishing this latched command for the entire WAIT window
+          // (and as the long-tail of SAFE_HOLD if we ever fall back).
+          //
+          // Capturing the actual pose -- rather than the constructor's
+          // initial latch of target=default_angles, kp=0 -- means HAL
+          // smoothly takes ownership at the operator's current pose with
+          // no jolt:
+          //   * Real robot: if MC has been driving firmware-stand (knees
+          //     +28 deg, elbows -67 deg), the deploy now holds firmware-
+          //     stand. When the operator stops MC and the deploy's
+          //     commands actually take effect, there is no 33 deg elbow
+          //     snap toward DEFAULT_DOF.
+          //   * Sim --init-pose=gantry_hang / gantry_dangle / motion-RSI:
+          //     the bridge has spawned the body at a non-default pose;
+          //     the deploy now reads that pose from rs and latches it.
+          //     The body stays put through the autostart window.
+          //
+          // The soft-start ramp at CONTROL still blends from default_angles
+          // toward the policy output -- that is a separate concern and is
+          // tracked in the deploy plan (Phase 4d follow-up). The fix here
+          // only addresses the WAIT-time yank.
+          if (fresh) {
+            std::lock_guard<std::mutex> lk(latest_cmd_mutex_);
+            for (std::size_t i = 0; i < NUM_DOFS; ++i) {
+              latest_cmd_.target_pos_mj[i] = rs.joint_pos_mj[i];
+              latest_cmd_.stiffness_mj[i]  = cli_.dry_run ? 0.0 : kps[i];
+              latest_cmd_.damping_mj[i]    = cli_.dry_run ? 0.0 : kds[i];
+            }
+            latest_cmd_.reason = "wait_for_control_hold";
+          } else {
+            RCLCPP_ERROR(
+                node_->get_logger(),
+                "INIT->WAIT advance fired but SnapshotState reported the "
+                "state is stale; safe-hold latch left at constructor's "
+                "passive default. Will retry on next tick if the state "
+                "freshness re-asserts.");
+            return;
+          }
           state_.store(State::WAIT_FOR_CONTROL);
           control_entry_s_ = now;
           RCLCPP_INFO(node_->get_logger(),
-                      "INIT -> WAIT_FOR_CONTROL (all state sources fresh)");
+                      "INIT -> WAIT_FOR_CONTROL (all state sources fresh; "
+                      "safe-hold latched at current observed pose)");
         }
         return;
       }

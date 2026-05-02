@@ -155,6 +155,15 @@ SIM_INIT_FRAME=""
 SIM_VIEWER=false
 SIM_IMU_FROM=""
 SIM_HOLD_STIFFNESS_MULT=""
+# Bridge init-pose selector: empty = bridge default ('default'). 'gantry-hang'
+# triggers the bent-knee crouch + lowered pelvis + standby PD seeded to that
+# pose. See x2_mujoco_ros_bridge.py:GANTRY_HANG_OFFSETS_MJ for the details.
+SIM_INIT_POSE=""
+# ElasticBand suspension knobs: how far below the world [0,0,1] anchor the
+# band's pull-target sits, and a stiffness multiplier on the (kp,kd) gains.
+# Both empty = bridge defaults (length=0, kp_mult=1.0).
+SIM_BAND_LENGTH=""
+SIM_BAND_KP_MULT=""
 SIM_NO_ELASTIC_BAND=false
 # Set true to force the band ON even when --motion would auto-disable it.
 SIM_KEEP_ELASTIC_BAND=false
@@ -287,7 +296,7 @@ MC stop / restart (local + onbot modes):
                               10.0.1.40. Default: $MC_EM_URL_DEFAULT
 
 Sim mode (only applies when 'sim' is selected; all optional):
-  --sim-profile {parity,handoff,manual}
+  --sim-profile {parity,handoff,gantry,gantry-dangle,manual}
                               Two distinct closed-loop sim tests that
                               validate DIFFERENT invariants (BOTH should
                               pass before going to powered hardware):
@@ -317,8 +326,24 @@ Sim mode (only applies when 'sim' is selected; all optional):
                                            angles without tipping the
                                            robot, which is the actual
                                            bring-up sequence on hardware.
-                                           Recommended as the FINAL sim
-                                           gate before powered runs.
+
+                                gantry  -- bridge starts in a bent-knee
+                                           crouch (~10 cm pelvis drop),
+                                           elastic band ON for the entire
+                                           run with its pull-target ~3 cm
+                                           above the bent pelvis. The band
+                                           takes ~85-90 % of body weight,
+                                           ~10-15 % goes through the legs
+                                           into ground contact. This is
+                                           the EXACT pose the operator
+                                           holds the X2 in during gantry-
+                                           supported powered runs, so sim
+                                           and the real Phase 7-9 powered
+                                           bring-up test the same operating
+                                           point. Recommended as the FINAL
+                                           sim gate before powered runs;
+                                           closest sim analogue of the
+                                           gantry-on-the-real-robot test.
 
                                 manual  -- no auto-magic; whatever explicit
                                            flags the user passes are left
@@ -341,6 +366,22 @@ Sim mode (only applies when 'sim' is selected; all optional):
                               Multiplier on policy_parameters.kps used to
                               hold the default standing pose BEFORE the
                               deploy connects (default: 1.0).
+  --sim-init-pose {default,gantry-hang}
+                              Bridge init pose when --motion is NOT set.
+                              'default' = upright stand; 'gantry-hang' =
+                              bent-knee crouch with pelvis_z=0.75m. Auto-
+                              set by --sim-profile gantry; pass directly
+                              for ad-hoc experimentation.
+  --sim-band-length M         ElasticBand suspension length (m). Pull-target
+                              sits at world [0, 0, 1.0 - LENGTH]. Default 0
+                              (target above standing pelvis). Auto-set to
+                              0.22 by --sim-profile gantry (target ~3 cm
+                              above the bent pelvis at z=0.75).
+  --sim-band-kp-mult X        Multiplier on the ElasticBand's kp_pos /
+                              kd_pos. 1.0 = stiff (10000 / 1000); lower
+                              values (0.3-0.5) make the suspension softer
+                              / more forgiving. kd is scaled by sqrt(mult)
+                              to preserve the damping ratio.
   --sim-no-elastic-band       Disable the virtual ElasticBand. The band is
                               ON by default and hangs the pelvis from world
                               [0,0,1] so the robot stays upright while the
@@ -447,6 +488,9 @@ while [[ $# -gt 0 ]]; do
         --sim-viewer)             SIM_VIEWER=true; shift ;;
         --sim-imu-from)           SIM_IMU_FROM="$2"; shift 2 ;;
         --sim-hold-stiffness-mult) SIM_HOLD_STIFFNESS_MULT="$2"; shift 2 ;;
+        --sim-init-pose)          SIM_INIT_POSE="$2"; shift 2 ;;
+        --sim-band-length)        SIM_BAND_LENGTH="$2"; shift 2 ;;
+        --sim-band-kp-mult)       SIM_BAND_KP_MULT="$2"; shift 2 ;;
         --sim-no-elastic-band)    SIM_NO_ELASTIC_BAND=true; shift ;;
         --sim-keep-elastic-band)  SIM_KEEP_ELASTIC_BAND=true; shift ;;
         --sim-band-release-after-s) SIM_BAND_RELEASE_AFTER_S="$2"; shift 2 ;;
@@ -590,9 +634,9 @@ if [[ "$MODE" == "sim" ]]; then
         fi
     fi
     case "$SIM_PROFILE" in
-        parity|handoff|manual) : ;;
+        parity|handoff|gantry|gantry-dangle|manual) : ;;
         *)
-            echo -e "${RED}Error: --sim-profile must be one of: parity, handoff, manual (got '$SIM_PROFILE')${NC}" >&2
+            echo -e "${RED}Error: --sim-profile must be one of: parity, handoff, gantry, gantry-dangle, manual (got '$SIM_PROFILE')${NC}" >&2
             exit 1
             ;;
     esac
@@ -676,8 +720,97 @@ if [[ "$MODE" == "sim" ]]; then
                 echo -e "${BLUE}[sim:handoff]${NC} --ramp-seconds: deploy default (2.0s)"
             fi
             ;;
+        gantry)
+            # ===== Profile C: gantry =====
+            # Goal: mirror the EXACT physical state the operator keeps the
+            # X2 in during gantry-supported powered runs (deploy plan
+            # Phase 7-9). The real robot is in a bent-knee crouch with
+            # pelvis ~10 cm below standing height, the gantry strap takes
+            # ~85-90 % of body weight, the feet just barely touch the
+            # ground transmitting ~10-15 %. This profile sets the sim up
+            # the same way so the closed-loop sim test and the powered
+            # bring-up test the same operating point.
+            #
+            # Setup (driven by the bridge's new --init-pose / --band-*
+            # knobs):
+            #   * --init-pose=gantry-hang      MC-stand pose (captured live
+            #                                  from the real X2 in firmware-
+            #                                  stand mode; pelvis_z=0.665 m)
+            #   * --band-length=GANTRY_HANG_BAND_LENGTH (~0.305 m) auto-
+            #                                  picked by the bridge when
+            #                                  init-pose=gantry-hang. Puts
+            #                                  the band pull-target ~3 cm
+            #                                  above the pelvis for ~88 %
+            #                                  body weight on the band.
+            #   * elastic band ON for the WHOLE run (no auto-release; the
+            #     operator decides when to lower the gantry on hardware,
+            #     so in sim we never auto-drop it)
+            #   * --ramp-seconds at deploy default (2.0 s)
+            #   * NO motion-RSI -- we want the policy to track the
+            #     reference (e.g. minimal_v1's standing frames) FROM the
+            #     captured firmware-stand pose, mirroring what happens
+            #     when MC stops on the real robot.
+            if [[ -n "$SIM_MOTION" ]]; then
+                echo -e "${YELLOW}[sim:gantry] ignoring --sim-motion (gantry profile starts at gantry-hang pose, not RSI)${NC}"
+                SIM_MOTION=""
+            fi
+            if [[ -z "$SIM_INIT_POSE" ]]; then
+                SIM_INIT_POSE="gantry_hang"
+                echo -e "${BLUE}[sim:gantry]${NC} init pose: gantry_hang (firmware-stand pose, pelvis_z=0.665m, from sim_init_poses.yaml)"
+            fi
+            if [[ -z "$SIM_BAND_LENGTH" ]]; then
+                # Leave SIM_BAND_LENGTH empty so the bridge picks the
+                # YAML's `band_length` for whichever pose was selected.
+                # The operator can still override via --sim-band-length.
+                echo -e "${BLUE}[sim:gantry]${NC} band length: pulled from sim_init_poses.yaml entry for this pose"
+            fi
+            if [[ "$SIM_NO_ELASTIC_BAND" == "true" ]]; then
+                echo -e "${YELLOW}[sim:gantry] --sim-no-elastic-band conflicts with this profile; re-enabling band${NC}"
+                SIM_NO_ELASTIC_BAND=false
+            fi
+            # Keep band ON forever -- the gantry doesn't auto-release in
+            # reality. Operator picks when to lower; sim mirrors that.
+            if [[ -z "$SIM_BAND_RELEASE_AFTER_S" ]]; then
+                SIM_BAND_RELEASE_AFTER_S="-1"
+                echo -e "${BLUE}[sim:gantry]${NC} band release: never (sim runs until --max-duration, mirroring an operator who keeps the gantry up)"
+            fi
+            if [[ -z "$RAMP_SECONDS" ]]; then
+                echo -e "${BLUE}[sim:gantry]${NC} --ramp-seconds: deploy default (2.0s)"
+            fi
+            ;;
+        gantry-dangle)
+            # ===== Profile C2: gantry-dangle =====
+            # Stress test: zero-torque hanging pose (MC fully stopped, robot
+            # passive on the gantry). Pelvis sags ~4 cm below DEFAULT_DOF as
+            # legs collapse into a deep crouch under gravity. Less common
+            # in real bring-up than `gantry`, but useful for testing the
+            # policy's recovery from off-distribution starting poses.
+            # Captured from real X2 via x2_capture_pose.py (capture C).
+            if [[ -n "$SIM_MOTION" ]]; then
+                echo -e "${YELLOW}[sim:gantry-dangle] ignoring --sim-motion (profile starts at gantry_dangle pose, not RSI)${NC}"
+                SIM_MOTION=""
+            fi
+            if [[ -z "$SIM_INIT_POSE" ]]; then
+                SIM_INIT_POSE="gantry_dangle"
+                echo -e "${BLUE}[sim:gantry-dangle]${NC} init pose: gantry_dangle (zero-torque hanging, pelvis_z=0.603m, from sim_init_poses.yaml)"
+            fi
+            if [[ -z "$SIM_BAND_LENGTH" ]]; then
+                echo -e "${BLUE}[sim:gantry-dangle]${NC} band length: pulled from sim_init_poses.yaml entry for this pose"
+            fi
+            if [[ "$SIM_NO_ELASTIC_BAND" == "true" ]]; then
+                echo -e "${YELLOW}[sim:gantry-dangle] --sim-no-elastic-band conflicts with this profile; re-enabling band${NC}"
+                SIM_NO_ELASTIC_BAND=false
+            fi
+            if [[ -z "$SIM_BAND_RELEASE_AFTER_S" ]]; then
+                SIM_BAND_RELEASE_AFTER_S="-1"
+                echo -e "${BLUE}[sim:gantry-dangle]${NC} band release: never"
+            fi
+            if [[ -z "$RAMP_SECONDS" ]]; then
+                echo -e "${BLUE}[sim:gantry-dangle]${NC} --ramp-seconds: deploy default (2.0s)"
+            fi
+            ;;
         manual)
-            # ===== Profile C: manual =====
+            # ===== Profile D: manual =====
             # No automatic policy. Catch the deprecated explicit
             # --sim-motion case so users see the new one-arg ergonomics,
             # but don't override anything they set.
@@ -1112,6 +1245,9 @@ if [[ "$MODE" == "sim" ]]; then
     [[ -n "$SIM_IMU_FROM" ]] && echo -e "  IMU from:           ${GREEN}$SIM_IMU_FROM${NC}"
     [[ -n "$SIM_HOLD_STIFFNESS_MULT" ]] && \
         echo -e "  Hold stiffness x:   ${GREEN}$SIM_HOLD_STIFFNESS_MULT${NC}"
+    [[ -n "$SIM_INIT_POSE" ]]   && echo -e "  Init pose:          ${GREEN}$SIM_INIT_POSE${NC}"
+    [[ -n "$SIM_BAND_LENGTH" ]] && echo -e "  Band length:        ${GREEN}${SIM_BAND_LENGTH}m${NC}"
+    [[ -n "$SIM_BAND_KP_MULT" ]] && echo -e "  Band kp mult:       ${GREEN}$SIM_BAND_KP_MULT${NC}"
     if $SIM_NO_ELASTIC_BAND; then
         echo -e "  ElasticBand:        ${YELLOW}disabled${NC}"
     elif $SIM_VIEWER; then
@@ -1228,6 +1364,9 @@ elif [[ "$MODE" == "sim" ]]; then
     [[ -n "$SIM_INIT_FRAME" ]]           && BRIDGE_ARGS+=("--init-frame" "$SIM_INIT_FRAME")
     [[ -n "$SIM_IMU_FROM" ]]             && BRIDGE_ARGS+=("--imu-from" "$SIM_IMU_FROM")
     [[ -n "$SIM_HOLD_STIFFNESS_MULT" ]]  && BRIDGE_ARGS+=("--hold-stiffness-mult" "$SIM_HOLD_STIFFNESS_MULT")
+    [[ -n "$SIM_INIT_POSE" ]]            && BRIDGE_ARGS+=("--init-pose" "$SIM_INIT_POSE")
+    [[ -n "$SIM_BAND_LENGTH" ]]          && BRIDGE_ARGS+=("--band-length" "$SIM_BAND_LENGTH")
+    [[ -n "$SIM_BAND_KP_MULT" ]]         && BRIDGE_ARGS+=("--band-kp-mult" "$SIM_BAND_KP_MULT")
     $SIM_NO_ELASTIC_BAND                 && BRIDGE_ARGS+=("--no-elastic-band")
     [[ -n "$SIM_BAND_RELEASE_AFTER_S" ]] && BRIDGE_ARGS+=("--band-release-after-s" "$SIM_BAND_RELEASE_AFTER_S")
     [[ -n "$SIM_DT" ]]                   && BRIDGE_ARGS+=("--sim-dt" "$SIM_DT")

@@ -13,12 +13,29 @@
 #                                       (record-and-replay/docker-compose.yml
 #                                       uses this same value, which is what
 #                                       lets it discover /aima/hal/* topics).
-#   * CYCLONEDDS_URI:    enp10s0     — pin DDS discovery to the wired NIC
-#                                       carrying 10.0.1.2/24, so it doesn't
-#                                       waste packets scanning wifi /
-#                                       tailscale / docker0.  Harmless under
-#                                       FastDDS (just an unused env var) but
-#                                       essential if anyone swaps the rmw.
+#
+# What this overlay does NOT set anymore:
+#
+#   * CYCLONEDDS_URI                 — REMOVED. The image's RMW is FastDDS
+#                                       (`rmw_fastrtps_cpp`), which ignores
+#                                       this env entirely. Earlier copies
+#                                       of the file pinned it to a
+#                                       hard-coded NIC name (`enp10s0`,
+#                                       `enp2s0`, ...) inherited from
+#                                       `agitbot-x2-record-and-replay` and
+#                                       `agibot-x2-monitor`, but those were
+#                                       dead code on this image and only
+#                                       confused new operators when their
+#                                       NIC was named differently. With
+#                                       network_mode: host + FastDDS
+#                                       multicast discovery, ROS will find
+#                                       the robot on whichever interface
+#                                       has the L2/L3 path. If your host
+#                                       has multiple paths to the robot
+#                                       (e.g. wifi *and* SDK ethernet),
+#                                       set `RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`
+#                                       and `CYCLONEDDS_URI=...` explicitly
+#                                       at the command line for that run.
 # What it does NOT change from the sim base:
 #   * network_mode: host             — kept; required for both DDS over the
 #                                       SDK ethernet AND the HTTP MC stop on
@@ -44,5 +61,4 @@ services:
       # normalises both to a single map keyed by variable name.
       ROS_LOCALHOST_ONLY: "0"
       ROS_DOMAIN_ID: "0"
-      CYCLONEDDS_URI: '<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="enp10s0"/></Interfaces></General></Domain></CycloneDDS>'
       PYTHONUNBUFFERED: "1"

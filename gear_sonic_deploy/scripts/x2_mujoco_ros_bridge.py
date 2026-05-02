@@ -151,6 +151,60 @@ GROUPS = [
 ]
 
 
+# ----------------------------------------------------------------------------
+# Init-pose YAML loader
+# ----------------------------------------------------------------------------
+# The bridge supports a set of named "init poses" -- the joint-space and
+# floating-base configuration the simulated robot starts in before the
+# deploy node connects. ``--init-pose default`` is hard-coded inside the
+# bridge (DEFAULT_DOF + pelvis_z=0.85 with the band engaged); every other
+# named pose is loaded from
+#
+#   gear_sonic_deploy/config/sim_init_poses.yaml
+#
+# That YAML maps a name (e.g. ``gantry_hang``, ``gantry_dangle``) to a
+# pelvis_z, an ElasticBand suspension length, and a per-joint offset
+# table from DEFAULT_DOF. Operators edit the YAML to add or tune poses
+# without touching this file. See ``sim_init_poses.yaml`` itself for the
+# schema.
+#
+# Numbers in the shipped YAML were captured live from the real robot via
+# ``gear_sonic_deploy/scripts/x2_capture_pose.py`` and post-processed
+# (symmetrize L/R, drop noise) so sim mirrors a defensible operating
+# point. The original captures are kept under ``scripts/_capture_*.json``.
+_INIT_POSES_YAML_PATH = pathlib.Path(__file__).resolve().parents[1] / \
+    "config" / "sim_init_poses.yaml"
+
+
+def _load_named_init_poses(path: pathlib.Path = _INIT_POSES_YAML_PATH) -> dict:
+    """Read the init-poses YAML; return ``{}`` if it's missing.
+
+    The bridge falls back to the hard-coded ``default`` pose when the
+    YAML is absent or empty, so a bad / missing config never bricks
+    sim startup. Bad entries (missing required keys, joint name typos)
+    raise loudly at first use, since silently dropping them would mask
+    real bugs.
+    """
+    if not path.is_file():
+        print(f"[bridge] init-pose YAML not found at {path}; only "
+              f"--init-pose=default will be available.", file=sys.stderr)
+        return {}
+    try:
+        import yaml
+    except ImportError as e:
+        raise RuntimeError(
+            f"PyYAML is required to load {path}. Install python3-yaml or "
+            "use --init-pose=default."
+        ) from e
+    with path.open() as f:
+        raw = yaml.safe_load(f) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"{path}: top-level YAML must be a mapping of pose-name -> entry."
+        )
+    return raw
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=__doc__.split("\n", 1)[0],
@@ -172,9 +226,38 @@ Examples:
                    help="Optional motion source for Reference State Initialization (RSI). "
                         "Accepts a motion-lib .pkl or a warehouse playlist .yaml/.yml "
                         "(resolved via the same loaders eval_x2_mujoco_onnx.py uses). "
-                        "If omitted, the robot starts in the default standing pose.")
+                        "Mutually exclusive with --init-pose=gantry-hang. "
+                        "If omitted, the robot starts in --init-pose (default: 'default').")
     p.add_argument("--init-frame", type=int, default=0,
                    help="Motion frame to RSI from (default 0).")
+    p.add_argument("--init-pose", default="default",
+                   help="Initial pose when --motion is NOT set. 'default' is "
+                        "the legacy hard-coded behaviour (DEFAULT_DOF at "
+                        "pelvis_z=0.85m, band fully engaged). Any other name "
+                        "is looked up in config/sim_init_poses.yaml -- ship a "
+                        "new pose by editing that file, no code changes "
+                        "needed. The shipped YAML defines 'gantry_hang' "
+                        "(MC-stand handoff pose, captured from the real X2) "
+                        "and 'gantry_dangle' (zero-torque hanging pose, "
+                        "captured from the real X2). Hyphens and underscores "
+                        "are equivalent in pose names.")
+    p.add_argument("--band-length", type=float, default=0.0,
+                   help="ElasticBand suspension length (m). The band's anchor "
+                        "is at world [0,0,1.0]; --band-length offsets the pull "
+                        "target downward to [0,0,1.0-LENGTH]. Default 0.0 "
+                        "(target at z=1.0, lifts pelvis above standing). For "
+                        "the gantry-hang profile use ~0.22 to put the pull "
+                        "target ~3 cm above the bent pelvis (~88 %% body "
+                        "weight supported, ~12 %% on feet). Viewer keys 7/8 "
+                        "still tweak at runtime.")
+    p.add_argument("--band-kp-mult", type=float, default=1.0,
+                   help="Multiplier on the ElasticBand's kp_pos / kd_pos. "
+                        "1.0 = current 10000 / 1000 (stiff, near critically "
+                        "damped at default mass). Lower values (0.3-0.5) make "
+                        "the band softer / more forgiving so the body bobs "
+                        "naturally on the legs instead of being yanked rigidly "
+                        "around its anchor. kd_pos is scaled by sqrt(mult) to "
+                        "preserve the damping ratio.")
     p.add_argument("--viewer", action="store_true",
                    help="Open the MuJoCo passive viewer window.")
     p.add_argument("--sim-dt", type=float, default=0.001,
@@ -322,6 +405,18 @@ class X2MujocoRosBridge:
         self.band_attached_link: int = -1
         if not args.no_elastic_band and self.has_floating_base:
             self.elastic_band = ElasticBand()
+            # Initial value from the CLI; ``_reset_to_named_pose`` may
+            # override this from the YAML entry's ``band_length`` if the
+            # operator left ``--band-length`` at its default (0). With
+            # length=0 and a low pelvis (e.g. z=0.6), the band would yank
+            # the body upward with hundreds of N -- exactly the surprise
+            # the YAML override engineers around.
+            self.elastic_band.length = float(args.band_length)
+            if args.band_kp_mult != 1.0:
+                self.elastic_band.kp_pos *= float(args.band_kp_mult)
+                # Scale damping by sqrt(mult) to preserve the damping ratio
+                # ``zeta = kd / (2 * sqrt(kp * m))`` as kp scales.
+                self.elastic_band.kd_pos *= float(np.sqrt(args.band_kp_mult))
             # X2's pelvis is the natural attach point (matches base_sim.py's
             # ``elif "g1" ... waist`` branch -- in our MJCF the waist body IS
             # the pelvis-mounted free body).
@@ -370,10 +465,25 @@ class X2MujocoRosBridge:
             )
 
         # --- Initial pose ---
+        # Hyphens and underscores are equivalent (so --init-pose=gantry-hang
+        # and --init-pose=gantry_hang both resolve the same way).
+        normalized_init_pose = args.init_pose.replace("-", "_")
+        if args.motion and normalized_init_pose != "default":
+            raise ValueError(
+                f"Cannot combine --motion (RSI from motion frame) with "
+                f"--init-pose={args.init_pose!r}. RSI puts the robot at the "
+                "motion's frame 0 pose; named init poses put it in a fixed "
+                "configuration. Pick one. (For sim profiles built around a "
+                "named pose, no --motion is needed; the deploy node still "
+                "loads its --motion arg as the *reference* the policy "
+                "tracks; the bridge's init pose is independent.)"
+            )
         if args.motion:
             self._rsi_from_motion(args.motion, args.init_frame)
-        else:
+        elif normalized_init_pose == "default":
             self._reset_to_default_pose()
+        else:
+            self._reset_to_named_pose(normalized_init_pose)
 
         if args.print_scene:
             self._print_scene()
@@ -626,6 +736,89 @@ class X2MujocoRosBridge:
             self.mj_data.qpos[3:7] = np.array([1.0, 0.0, 0.0, 0.0])  # wxyz identity
         mujoco.mj_forward(self.mj_model, self.mj_data)
 
+    def _reset_to_named_pose(self, pose_name: str):
+        """Initialize from a named entry in ``sim_init_poses.yaml``.
+
+        Looks up ``pose_name`` (hyphens already normalized to underscores
+        upstream), validates schema, applies per-joint offsets atop
+        DEFAULT_DOF, sets the floating base at the YAML's ``pelvis_z``,
+        and seeds the standby PD setpoint to the resulting joint config
+        so the bridge holds the captured pose during autostart instead of
+        fighting it by pulling toward DEFAULT_DOF.
+
+        ``ElasticBand.length`` is also overridden from the YAML's
+        ``band_length`` *only if the operator left ``--band-length`` at
+        its default (0.0)*; an explicit ``--band-length`` always wins.
+        """
+        poses = _load_named_init_poses()
+        if pose_name not in poses:
+            available = sorted(poses.keys()) or ["<none -- YAML missing>"]
+            raise ValueError(
+                f"Unknown --init-pose {pose_name!r}. "
+                f"Available poses in {_INIT_POSES_YAML_PATH}: {available}. "
+                "Use --init-pose=default for the built-in legacy behaviour."
+            )
+        entry = poses[pose_name]
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"{_INIT_POSES_YAML_PATH}: pose {pose_name!r} must be a mapping."
+            )
+
+        # Required fields.
+        try:
+            pelvis_z = float(entry["pelvis_z"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise ValueError(
+                f"{_INIT_POSES_YAML_PATH}: pose {pose_name!r} missing or "
+                "invalid required field 'pelvis_z' (float, m)."
+            ) from e
+        offsets_rad = entry.get("offsets_rad") or {}
+        if not isinstance(offsets_rad, dict):
+            raise ValueError(
+                f"{_INIT_POSES_YAML_PATH}: pose {pose_name!r}.offsets_rad "
+                "must be a mapping of joint_name -> float."
+            )
+
+        # Build the qpos joint vector starting from DEFAULT_DOF.
+        target_dof = self.eval_x2.DEFAULT_DOF.astype(np.float64).copy()
+        name_to_idx = {n: i for i, n in
+                        enumerate(self.eval_x2.MUJOCO_JOINT_NAMES)}
+        unknown: list[str] = []
+        for joint_name, offset in offsets_rad.items():
+            try:
+                mj_idx = name_to_idx[str(joint_name)]
+            except KeyError:
+                unknown.append(str(joint_name))
+                continue
+            target_dof[mj_idx] += float(offset)
+        if unknown:
+            raise ValueError(
+                f"{_INIT_POSES_YAML_PATH}: pose {pose_name!r} references "
+                f"unknown joint name(s) {unknown}. Valid names are in "
+                "x2_mujoco_ros_bridge.MUJOCO_JOINT_NAMES."
+            )
+
+        # Apply to MuJoCo state.
+        mujoco.mj_resetData(self.mj_model, self.mj_data)
+        for i in range(self.eval_x2.NUM_DOFS):
+            self.mj_data.qpos[self.qpos_adr[i]] = float(target_dof[i])
+            self.mj_data.qvel[self.qvel_adr[i]] = 0.0
+        if self.has_floating_base:
+            self.mj_data.qpos[2] = pelvis_z
+            self.mj_data.qpos[3:7] = np.array([1.0, 0.0, 0.0, 0.0])  # wxyz identity
+        mujoco.mj_forward(self.mj_model, self.mj_data)
+
+        # Override ElasticBand length from YAML iff operator left it at the
+        # CLI default. Explicit --band-length always wins.
+        band_length = entry.get("band_length")
+        if band_length is not None and self.elastic_band is not None \
+                and float(self.args.band_length) == 0.0:
+            self.elastic_band.length = float(band_length)
+
+        with self.cmd_lock:
+            self._target_pos = target_dof.copy()
+        self._init_pose_name = pose_name  # for the startup banner
+
     def _rsi_from_motion(self, motion_path: pathlib.Path, frame: int):
         if not motion_path.is_file():
             raise FileNotFoundError(f"Motion not found: {motion_path}")
@@ -777,17 +970,30 @@ class X2MujocoRosBridge:
         if self.args.motion:
             print(f"  RSI motion          {self.args.motion} (frame {self.args.init_frame})")
         else:
-            print(f"  Initial pose        DEFAULT_DOF (standing)")
+            pose_label = getattr(self, "_init_pose_name", None)
+            if pose_label is None:
+                print(f"  Initial pose        DEFAULT_DOF (standing, pelvis_z=0.85m)")
+            else:
+                pelvis = float(self.mj_data.qpos[2]) if self.has_floating_base else float("nan")
+                print(f"  Initial pose        {pose_label} (from "
+                      f"{_INIT_POSES_YAML_PATH.name}, pelvis_z={pelvis:.3f}m)")
         print(f"  hold-stiffness-mult {self.args.hold_stiffness_mult}")
         if self.elastic_band is not None:
+            band_extra = (
+                f"length={self.elastic_band.length:.3f}m, "
+                f"kp={self.elastic_band.kp_pos:.0f}/kd={self.elastic_band.kd_pos:.0f}"
+            )
             if self.args.viewer:
-                print(f"  ElasticBand         ENABLED  (viewer keys: 9 toggle, 7/8 lower/raise)")
+                print(f"  ElasticBand         ENABLED  ({band_extra}; "
+                      f"viewer keys: 9 toggle, 7/8 lower/raise)")
             else:
                 if self.args.band_release_after_s >= 0.0:
-                    print(f"  ElasticBand         ENABLED  (auto-release "
-                          f"{self.args.band_release_after_s:.2f}s after first deploy cmd)")
+                    print(f"  ElasticBand         ENABLED  ({band_extra}; "
+                          f"auto-release {self.args.band_release_after_s:.2f}s "
+                          f"after first deploy cmd)")
                 else:
-                    print(f"  ElasticBand         ENABLED  (headless, NEVER auto-release)")
+                    print(f"  ElasticBand         ENABLED  ({band_extra}; "
+                          f"headless, NEVER auto-release)")
         else:
             print(f"  ElasticBand         disabled")
         print(f"  viewer              {self.args.viewer}")
