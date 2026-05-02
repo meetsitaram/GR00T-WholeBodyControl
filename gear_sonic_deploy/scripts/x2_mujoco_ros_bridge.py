@@ -169,7 +169,9 @@ Examples:
     p.add_argument("--mjcf", type=pathlib.Path, default=None,
                    help="MJCF path (default: gear_sonic/data/assets/.../x2_ultra.xml)")
     p.add_argument("--motion", type=pathlib.Path, default=None,
-                   help="Optional motion-lib PKL for Reference State Initialization (RSI). "
+                   help="Optional motion source for Reference State Initialization (RSI). "
+                        "Accepts a motion-lib .pkl or a warehouse playlist .yaml/.yml "
+                        "(resolved via the same loaders eval_x2_mujoco_onnx.py uses). "
                         "If omitted, the robot starts in the default standing pose.")
     p.add_argument("--init-frame", type=int, default=0,
                    help="Motion frame to RSI from (default 0).")
@@ -627,7 +629,21 @@ class X2MujocoRosBridge:
     def _rsi_from_motion(self, motion_path: pathlib.Path, frame: int):
         if not motion_path.is_file():
             raise FileNotFoundError(f"Motion not found: {motion_path}")
-        data = self.eval_x2.load_motion_data(str(motion_path))
+        suffix = motion_path.suffix.lower()
+        if suffix == ".pkl":
+            data = self.eval_x2.load_motion_data(str(motion_path))
+        elif suffix in (".yaml", ".yml"):
+            # Same builder ``eval_x2_mujoco_onnx.py --playlist`` uses, so the
+            # bridge's RSI init is bit-identical to what the Python sim-to-sim
+            # eval starts from.
+            data = self.eval_x2.load_playlist_motion_data(str(motion_path))
+        else:
+            raise ValueError(
+                f"Unsupported motion source extension {suffix!r} for {motion_path}; "
+                f"expected .pkl, .yaml, or .yml. (X2M2 is the deploy-binary "
+                f"runtime format, not an RSI source -- pass the original PKL/YAML "
+                f"the X2M2 was baked from.)"
+            )
         fps = self.eval_x2.get_motion_fps(data)
         state = self.eval_x2.compute_motion_state(data, frame, fps)
         mujoco.mj_resetData(self.mj_model, self.mj_data)

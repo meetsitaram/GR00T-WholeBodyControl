@@ -54,6 +54,13 @@ NC='\033[0m' # No Color
 
 # Script directory (where this script is located)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Save the user's original CWD BEFORE we cd into SCRIPT_DIR so abspath() can
+# resolve relative paths the way the user expects (against where they ran the
+# command, not against gear_sonic_deploy/). Without this, a repo-rooted
+# invocation like ``./gear_sonic_deploy/deploy_x2.sh ... --motion
+# gear_sonic/data/motions/playlists/minimal_v1.yaml`` silently resolves the
+# motion path against gear_sonic_deploy/ and fails to find the file.
+USER_CWD="$(pwd)"
 cd "$SCRIPT_DIR"
 
 PKG_NAME="agi_x2_deploy_onnx_ref"
@@ -92,6 +99,14 @@ MC_STOPPED_BY_US=false
 # Deploy CLI passthrough flags
 MODEL=""
 MOTION=""
+# Set when --motion is a PKL or YAML and we bake an x2m2 on the fly. Holds
+# the absolute path to the original PKL/YAML so the wrapper can route it to
+# the MuJoCo bridge as --sim-motion (matching what eval_x2_mujoco_onnx.py
+# RSIs from). Empty when --motion was passed as an .x2m2 (legacy passthrough)
+# or omitted entirely.
+MOTION_SOURCE=""
+# Per-run tempdir we bake the x2m2 into so it tears down on script exit.
+MOTION_BAKE_TMPDIR=""
 LOG_DIR=""
 AUTOSTART=""
 # Auto-shutdown N seconds after entering CONTROL state. Empty string =
@@ -141,7 +156,29 @@ SIM_VIEWER=false
 SIM_IMU_FROM=""
 SIM_HOLD_STIFFNESS_MULT=""
 SIM_NO_ELASTIC_BAND=false
+# Set true to force the band ON even when --motion would auto-disable it.
+SIM_KEEP_ELASTIC_BAND=false
 SIM_BAND_RELEASE_AFTER_S=""
+# --sim-profile selects between two distinct closed-loop sim test modes that
+# validate DIFFERENT invariants (both must pass before going to hardware):
+#   parity   -- bridge RSIs to motion frame 0, elastic band off, --ramp-seconds 0.
+#               Mirrors gear_sonic/scripts/eval_x2_mujoco_onnx.py exactly, so a
+#               working C++ deploy MUST hold 30s clean here. Validates the C++
+#               obs assembly + action application against the same ground truth
+#               Python uses for sim-to-sim eval. Default when --motion is a
+#               PKL or YAML (i.e. RSI is even possible).
+#   handoff  -- bridge starts at DEFAULT_DOF (matches real-robot MC handoff),
+#               soft-start ramp is left at the default (2.0s), elastic band
+#               stays on through the ramp + a buffer to proxy the gantry/MC
+#               support that holds the real robot upright until policy has
+#               full authority. Validates that the deploy can take over from
+#               default angles without tipping -- which is the actual
+#               sequence on the robot. Recommended as the FINAL sim gate
+#               before powered runs.
+#   manual   -- no auto-magic; whatever explicit flags the user passes are
+#               left alone. Default when --motion is a .x2m2 (legacy passthrough)
+#               or omitted entirely.
+SIM_PROFILE=""
 SIM_DT=""
 SIM_PRINT_SCENE=false
 SIM_RECORD_COMMANDS=""
@@ -177,7 +214,17 @@ Required:
   --model PATH                Fused g1+g1_dyn ONNX (e.g. *_g1.onnx)
 
 Optional deploy flags (forwarded to ros2 run):
-  --motion PATH               X2M2 reference motion file (default: StandStill)
+  --motion PATH               Reference motion. Accepts .pkl (motion-lib),
+                              .yaml (warehouse playlist), or .x2m2 (deploy
+                              runtime format). PKL/YAML are baked on the fly
+                              to a tempdir .x2m2 the deploy binary loads;
+                              the same source PKL/YAML is auto-passed to the
+                              MuJoCo bridge as --sim-motion (in sim mode) so
+                              both consumers see bit-identical motion data
+                              with no risk of drift. Pass an .x2m2 directly
+                              for legacy/already-baked artefacts. Default:
+                              StandStillReference (NOT recommended for
+                              policies trained on motion).
   --log-dir PATH              Per-tick CSV log directory
   --autostart-after SECONDS         Auto-transition WAIT->CONTROL after N seconds
                               (default: -1, wait for stdin 'go')
@@ -240,8 +287,51 @@ MC stop / restart (local + onbot modes):
                               10.0.1.40. Default: $MC_EM_URL_DEFAULT
 
 Sim mode (only applies when 'sim' is selected; all optional):
+  --sim-profile {parity,handoff,manual}
+                              Two distinct closed-loop sim tests that
+                              validate DIFFERENT invariants (BOTH should
+                              pass before going to powered hardware):
+
+                                parity  -- bridge RSIs to motion frame 0,
+                                           elastic band off, --ramp-seconds 0.
+                                           Mirrors eval_x2_mujoco_onnx.py
+                                           exactly. A correct C++ deploy
+                                           MUST hold 30s clean here. Tests
+                                           the C++ obs assembly + action
+                                           pipeline against the Python
+                                           ground truth. (Default when
+                                           --motion is a PKL or YAML.)
+
+                                handoff -- bridge starts at DEFAULT_DOF
+                                           (matches what the real robot
+                                           looks like at the moment the MC
+                                           controller releases the joints),
+                                           soft-start ramp at the deploy
+                                           default (2.0s), elastic band ON
+                                           through the ramp + a buffer to
+                                           proxy the gantry support that
+                                           keeps the real robot upright
+                                           until the policy has full
+                                           authority. Tests that the deploy
+                                           can take over from default
+                                           angles without tipping the
+                                           robot, which is the actual
+                                           bring-up sequence on hardware.
+                                           Recommended as the FINAL sim
+                                           gate before powered runs.
+
+                                manual  -- no auto-magic; whatever explicit
+                                           flags the user passes are left
+                                           alone. Default when --motion is
+                                           a .x2m2 or omitted entirely.
+
   --sim-mjcf PATH             Override MJCF path (default: x2_ultra.xml).
-  --sim-motion PATH           RSI from a motion-lib PKL (default: stand pose).
+  --sim-motion PATH           [DEPRECATED] RSI source for the bridge.
+                              Prefer just passing --motion <pkl|yaml>; this
+                              wrapper now auto-derives the bridge's RSI source
+                              from --motion when it's a PKL or YAML. This
+                              flag is retained for back-compat / explicit
+                              overrides only.
   --sim-init-frame N          Motion frame to RSI from (default 0).
   --sim-viewer                Open the MuJoCo passive viewer window.
   --sim-imu-from {pelvis,torso}
@@ -256,6 +346,18 @@ Sim mode (only applies when 'sim' is selected; all optional):
                               [0,0,1] so the robot stays upright while the
                               policy spins up. With viewer, press 9 to drop;
                               headless, see --sim-band-release-after-s.
+                              NOTE: when --motion resolves to a PKL/YAML
+                              (i.e. the bridge can RSI from frame 0), this
+                              wrapper auto-disables the band so the robot
+                              spawns in stable contact equilibrium instead
+                              of being suspended-then-dropped (the latter
+                              produces a transient the policy was never
+                              trained on; see x2_deploy_architecture.md).
+                              Use --sim-keep-elastic-band to override.
+  --sim-keep-elastic-band     Force the elastic band ON even when --motion
+                              would otherwise auto-disable it. Useful for
+                              testing the suspended-then-dropped scenario
+                              explicitly.
   --sim-band-release-after-s SECS
                               When headless, auto-release the band SECS
                               seconds after the deploy's first command.
@@ -346,7 +448,9 @@ while [[ $# -gt 0 ]]; do
         --sim-imu-from)           SIM_IMU_FROM="$2"; shift 2 ;;
         --sim-hold-stiffness-mult) SIM_HOLD_STIFFNESS_MULT="$2"; shift 2 ;;
         --sim-no-elastic-band)    SIM_NO_ELASTIC_BAND=true; shift ;;
+        --sim-keep-elastic-band)  SIM_KEEP_ELASTIC_BAND=true; shift ;;
         --sim-band-release-after-s) SIM_BAND_RELEASE_AFTER_S="$2"; shift 2 ;;
+        --sim-profile)            SIM_PROFILE="$2"; shift 2 ;;
         --sim-dt)                 SIM_DT="$2"; shift 2 ;;
         --sim-print-scene)        SIM_PRINT_SCENE=true; shift ;;
         --sim-python)             SIM_PYTHON="$2"; shift 2 ;;
@@ -376,17 +480,39 @@ if [[ "$MODE" != "local" && "$MODE" != "onbot" && "$MODE" != "sim" ]]; then
     exit 1
 fi
 
-# Resolve absolute paths for local artefacts so onbot rsync works.
+# Resolve absolute paths for local artefacts so onbot rsync works. We
+# resolve relative paths against $USER_CWD (the directory the user ran us
+# from, captured BEFORE we cd into SCRIPT_DIR) -- this matches how every
+# other CLI tool in the world treats paths. Failing the resolution loudly
+# (rather than silently producing /$basename) catches typos before they
+# turn into "file not found" deep inside a phase that already started.
 abspath() {
     local p="$1"
     if [[ -z "$p" ]]; then
         echo ""
+        return 0
     elif [[ "$p" = /* ]]; then
         echo "$p"
-    else
-        # Resolve relative to caller's CWD (which is now SCRIPT_DIR).
-        echo "$(cd "$(dirname "$p")" 2>/dev/null && pwd)/$(basename "$p")"
+        return 0
     fi
+    local dir
+    dir="$(dirname "$p")"
+    # First try as-is from USER_CWD (the operator's original directory).
+    if [[ -d "$USER_CWD/$dir" ]]; then
+        echo "$(cd "$USER_CWD/$dir" && pwd)/$(basename "$p")"
+        return 0
+    fi
+    # Fall back to SCRIPT_DIR-relative for back-compat with the old
+    # behaviour (some doc invocations assume cwd == gear_sonic_deploy/).
+    if [[ -d "$SCRIPT_DIR/$dir" ]]; then
+        echo "$(cd "$SCRIPT_DIR/$dir" && pwd)/$(basename "$p")"
+        return 0
+    fi
+    # Neither directory exists -- emit a non-empty marker so downstream
+    # validation (-f checks) fail with a helpful path instead of swallowing
+    # the input. Prefix with USER_CWD/ so the error message points at where
+    # we looked.
+    echo "$USER_CWD/$p"
 }
 
 if [[ "$MODE" == "local" || "$MODE" == "sim" ]]; then
@@ -394,11 +520,172 @@ if [[ "$MODE" == "local" || "$MODE" == "sim" ]]; then
     [[ -n "$MOTION" ]] && MOTION="$(abspath "$MOTION")"
     [[ -n "$LOG_DIR" ]] && LOG_DIR="$(abspath "$LOG_DIR")"
 fi
+# onbot also needs an absolute MOTION path (so abspath sees the local file
+# before we rsync it over) -- the rsync block reads $MOTION as a local path.
+if [[ "$MODE" == "onbot" && -n "$MOTION" ]]; then
+    MOTION="$(abspath "$MOTION")"
+fi
+
+# ---------------------------------------------------------------------------
+# --motion source-of-truth normalization
+# ---------------------------------------------------------------------------
+# If --motion is a PKL or YAML, bake to a per-run tempdir x2m2 so:
+#   * the deploy binary always loads an x2m2 derived from THIS exact source
+#     (no chance of a stale gear_sonic_deploy/data/motions_x2m2/<x>.x2m2
+#     being silently consumed when the upstream PKL/YAML changed),
+#   * the bridge's RSI init reads the SAME source PKL/YAML, so init pose
+#     and reference-motion playback are bit-identical to what
+#     eval_x2_mujoco_onnx.py --playlist sees in Python sim-to-sim eval.
+# Pass an .x2m2 directly to keep legacy behaviour (no bake, no auto sim-motion).
+if [[ -n "$MOTION" ]]; then
+    case "${MOTION,,}" in
+        *.pkl|*.yaml|*.yml)
+            if [[ ! -f "$MOTION" ]]; then
+                echo -e "${RED}Error: --motion source does not exist: $MOTION${NC}" >&2
+                exit 1
+            fi
+            MOTION_SOURCE="$MOTION"
+            MOTION_BAKE_TMPDIR="$(mktemp -d -t x2_motion_bake.XXXXXX)"
+            MOTION_BAKED="$MOTION_BAKE_TMPDIR/motion.x2m2"
+            echo -e "${BLUE}[motion]${NC} baking $(basename "$MOTION_SOURCE") -> $MOTION_BAKED"
+            if ! "$SIM_PYTHON" "$SCRIPT_DIR/scripts/export_motion_for_deploy.py" \
+                    --in "$MOTION_SOURCE" --out "$MOTION_BAKED" --quiet; then
+                echo -e "${RED}Error: motion bake failed for $MOTION_SOURCE${NC}" >&2
+                rm -rf "$MOTION_BAKE_TMPDIR"
+                exit 1
+            fi
+            MOTION="$MOTION_BAKED"
+            # Make sure the tempdir is cleaned up on script exit. We append
+            # to any existing EXIT trap so the sim-mode cleanup_sim trap
+            # (installed later) still fires.
+            trap 'rm -rf "$MOTION_BAKE_TMPDIR"' EXIT
+            ;;
+        *.x2m2)
+            : # legacy passthrough; no MOTION_SOURCE, no auto sim-motion
+            ;;
+        *)
+            echo -e "${YELLOW}Warning: --motion has unrecognised extension: $MOTION${NC}" >&2
+            echo -e "${YELLOW}         Expected .pkl, .yaml, .yml, or .x2m2.${NC}" >&2
+            ;;
+    esac
+fi
 
 if [[ "$MODE" == "sim" ]]; then
     [[ -n "$SIM_MJCF" ]] && SIM_MJCF="$(abspath "$SIM_MJCF")"
     [[ -n "$SIM_MOTION" ]] && SIM_MOTION="$(abspath "$SIM_MOTION")"
     [[ -n "$SIM_RECORD_COMMANDS" ]] && SIM_RECORD_COMMANDS="$(abspath "$SIM_RECORD_COMMANDS")"
+
+    # ----------------------------------------------------------------
+    # --sim-profile resolution
+    # ----------------------------------------------------------------
+    # Resolve the default profile if the caller didn't pick one:
+    #   --motion <pkl|yaml>    -> default 'parity'  (validate C++ vs Python)
+    #   --motion <x2m2>        -> default 'manual'  (legacy / explicit flags)
+    #   --motion omitted       -> default 'manual'
+    if [[ -z "$SIM_PROFILE" ]]; then
+        if [[ -n "$MOTION_SOURCE" ]]; then
+            SIM_PROFILE="parity"
+        else
+            SIM_PROFILE="manual"
+        fi
+    fi
+    case "$SIM_PROFILE" in
+        parity|handoff|manual) : ;;
+        *)
+            echo -e "${RED}Error: --sim-profile must be one of: parity, handoff, manual (got '$SIM_PROFILE')${NC}" >&2
+            exit 1
+            ;;
+    esac
+    echo -e "${BLUE}[sim]${NC} sim profile: ${GREEN}$SIM_PROFILE${NC}"
+
+    case "$SIM_PROFILE" in
+        parity)
+            # ===== Profile A: parity =====
+            # Goal: validate the C++ deploy's obs assembly + action pipeline
+            # bit-for-bit against eval_x2_mujoco_onnx.py. A correct C++
+            # deploy MUST hold 30s clean here -- if it doesn't, the bug is
+            # in the C++ binary or the bridge's obs publication, NOT the
+            # policy or the motion data (since Python eval works under the
+            # same init).
+            #
+            # Setup:
+            #   * RSI from motion frame 0 (bridge needs source PKL/YAML).
+            #   * Elastic band off (no transient release into gravity).
+            #   * --ramp-seconds 0 (deploy at full alpha=1 from tick 0; the
+            #     ramp blends toward default_angles and would yank joints
+            #     away from the RSI'd pose for ~2s and tip the robot).
+            if [[ -z "$MOTION_SOURCE" ]]; then
+                echo -e "${RED}Error: --sim-profile parity requires --motion <pkl|yaml>${NC}" >&2
+                echo -e "${RED}       (RSI needs the source motion the C++ x2m2 was baked from).${NC}" >&2
+                exit 1
+            fi
+            if [[ -z "$SIM_MOTION" ]]; then
+                SIM_MOTION="$MOTION_SOURCE"
+                echo -e "${BLUE}[sim:parity]${NC} bridge RSI source: $(basename "$SIM_MOTION")"
+            fi
+            if [[ "$SIM_NO_ELASTIC_BAND" != "true" ]] \
+                    && [[ "$SIM_KEEP_ELASTIC_BAND" != "true" ]] \
+                    && [[ -z "$SIM_BAND_RELEASE_AFTER_S" ]]; then
+                SIM_NO_ELASTIC_BAND=true
+                echo -e "${BLUE}[sim:parity]${NC} elastic band: disabled (RSI gives stable ground contact at t=0)"
+            fi
+            if [[ -z "$RAMP_SECONDS" ]]; then
+                RAMP_SECONDS="0"
+                echo -e "${BLUE}[sim:parity]${NC} --ramp-seconds: 0 (mirrors Python eval; full alpha=1 from tick 0)"
+            fi
+            ;;
+        handoff)
+            # ===== Profile B: handoff =====
+            # Goal: validate the bring-up sequence the deploy will actually
+            # execute on the robot. The robot is at default_angles at t=0
+            # (just like the real robot when MC releases the joints); the
+            # deploy's soft-start ramp eases the policy in over ~2s; the
+            # gantry/operator keeps the body upright until the policy has
+            # full authority. We proxy the gantry with the elastic band,
+            # auto-released only AFTER the ramp completes plus a settle
+            # buffer (so the body doesn't drop while alpha is still climbing).
+            #
+            # Setup:
+            #   * NO RSI -- the bridge starts at DEFAULT_DOF, regardless of
+            #     whether --motion was a PKL/YAML. This is the whole point
+            #     of the handoff test.
+            #   * Standard soft-start ramp (default 2.0s) unless explicitly
+            #     overridden.
+            #   * Elastic band ON, with auto-release scheduled at
+            #     ramp_seconds + 2.0s after the first deploy command. This
+            #     gives the policy a full ramp + 2s of full-alpha control
+            #     to populate the proprioception buffer with fresh in-control
+            #     observations BEFORE the body is asked to support its own
+            #     weight.
+            if [[ -n "$SIM_MOTION" ]]; then
+                echo -e "${YELLOW}[sim:handoff] ignoring --sim-motion (handoff starts at DEFAULT_DOF, not RSI)${NC}"
+                SIM_MOTION=""
+            fi
+            if [[ "$SIM_KEEP_ELASTIC_BAND" == "true" ]] \
+                    || { [[ "$SIM_NO_ELASTIC_BAND" != "true" ]] \
+                         && [[ -z "$SIM_BAND_RELEASE_AFTER_S" ]]; }; then
+                # Default ramp_seconds is 2.0 in the C++ deploy; we use
+                # whatever the caller picked, falling back to 2.0.
+                local_ramp="${RAMP_SECONDS:-2.0}"
+                # Schedule band release for: ramp + 2s settle buffer.
+                SIM_BAND_RELEASE_AFTER_S="$(awk "BEGIN { print $local_ramp + 2.0 }")"
+                SIM_NO_ELASTIC_BAND=false
+                echo -e "${BLUE}[sim:handoff]${NC} elastic band: ON, auto-release ${SIM_BAND_RELEASE_AFTER_S}s after first deploy command (ramp + 2s settle)"
+            fi
+            if [[ -z "$RAMP_SECONDS" ]]; then
+                echo -e "${BLUE}[sim:handoff]${NC} --ramp-seconds: deploy default (2.0s)"
+            fi
+            ;;
+        manual)
+            # ===== Profile C: manual =====
+            # No automatic policy. Catch the deprecated explicit
+            # --sim-motion case so users see the new one-arg ergonomics,
+            # but don't override anything they set.
+            if [[ -n "$SIM_MOTION" && -z "$MOTION_SOURCE" ]]; then
+                echo -e "${YELLOW}[sim:manual] --sim-motion is deprecated; pass --motion <pkl|yaml> for the new auto-bake/source-of-truth path.${NC}" >&2
+            fi
+            ;;
+    esac
 
     BRIDGE_PATH="$SCRIPT_DIR/$SIM_BRIDGE_REL"
     if [[ ! -f "$BRIDGE_PATH" ]]; then
@@ -799,7 +1086,12 @@ echo -e "${CYAN}═════════════════════�
 echo ""
 echo -e "  Mode:               ${GREEN}$MODE${NC}"
 echo -e "  Model:              ${GREEN}${ROS2_ARGS[1]}${NC}"
-[[ -n "$MOTION" ]]      && echo -e "  Motion:             ${GREEN}$MOTION${NC}"
+if [[ -n "$MOTION_SOURCE" ]]; then
+    echo -e "  Motion source:      ${GREEN}$MOTION_SOURCE${NC}"
+    echo -e "  Motion (baked):     ${GREEN}$MOTION${NC} ${CYAN}(per-run tempdir)${NC}"
+elif [[ -n "$MOTION" ]]; then
+    echo -e "  Motion:             ${GREEN}$MOTION${NC}"
+fi
 [[ -n "$LOG_DIR" ]]     && echo -e "  Log dir:            ${GREEN}$LOG_DIR${NC}"
 [[ -n "$AUTOSTART" ]]   && echo -e "  Autostart (s):      ${GREEN}$AUTOSTART${NC}"
 [[ -n "$MAX_DURATION" ]] && echo -e "  Max duration (s):   ${GREEN}$MAX_DURATION${NC}"
