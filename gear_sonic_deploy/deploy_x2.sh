@@ -677,33 +677,55 @@ if [[ "$MODE" == "sim" ]]; then
                 RAMP_SECONDS="0"
                 echo -e "${BLUE}[sim:parity]${NC} --ramp-seconds: 0 (mirrors Python eval; full alpha=1 from tick 0)"
             fi
+            if [[ -z "$AUTOSTART" ]]; then
+                # Python eval has no WAIT phase: it RSIs to motion frame 0 and
+                # immediately ticks the policy. The longer the WAIT, the more
+                # opportunity for the bridge's standby PD to drift the body
+                # away from a clean RSI'd state (small numerical errors,
+                # imperfect joint vel cancellation, etc.) before the policy
+                # ever runs. Set autostart=0 so INIT->WAIT->CONTROL fires the
+                # instant the bridge has published a fresh state.
+                AUTOSTART="0"
+                echo -e "${BLUE}[sim:parity]${NC} --autostart-after: 0 (no WAIT; Python eval has none)"
+            fi
             ;;
         handoff)
             # ===== Profile B: handoff =====
-            # Goal: validate the bring-up sequence the deploy will actually
-            # execute on the robot. The robot is at default_angles at t=0
-            # (just like the real robot when MC releases the joints); the
-            # deploy's soft-start ramp eases the policy in over ~2s; the
-            # gantry/operator keeps the body upright until the policy has
-            # full authority. We proxy the gantry with the elastic band,
-            # auto-released only AFTER the ramp completes plus a settle
-            # buffer (so the body doesn't drop while alpha is still climbing).
+            # Goal: validate the bring-up sequence the deploy actually
+            # executes on the real robot. Real bring-up is:
+            #   1. Robot in firmware-stand on the gantry (knees ~+28 deg,
+            #      elbows ~-67 deg, gantry strap takes ~88% body weight,
+            #      feet just barely touching ground -- this is the
+            #      gantry_hang capture, NOT DEFAULT_DOF).
+            #   2. Operator stops MC; deploy starts.
+            #   3. Soft-start ramp blends commands from default_angles
+            #      toward policy output over ~2s.
+            #   4. Operator loosens the gantry strap; body now supports
+            #      its own weight against the policy's commands.
+            #   5. Policy holds the body upright on its own.
             #
-            # Setup:
-            #   * NO RSI -- the bridge starts at DEFAULT_DOF, regardless of
-            #     whether --motion was a PKL/YAML. This is the whole point
-            #     of the handoff test.
-            #   * Standard soft-start ramp (default 2.0s) unless explicitly
-            #     overridden.
-            #   * Elastic band ON, with auto-release scheduled at
-            #     ramp_seconds + 2.0s after the first deploy command. This
-            #     gives the policy a full ramp + 2s of full-alpha control
-            #     to populate the proprioception buffer with fresh in-control
-            #     observations BEFORE the body is asked to support its own
-            #     weight.
+            # Sim mirror:
+            #   * --init-pose=gantry_hang  (firmware-stand pose, feet at
+            #     floor, pelvis 0.665 m -- the actual real-robot start
+            #     state, captured live from the X2).
+            #   * Standard soft-start ramp (default 2.0s) unless overridden.
+            #   * Elastic band ON at gantry_hang's ~88% support, auto-
+            #     released ramp_seconds + 2.0s after the first deploy
+            #     command -- proxies the operator releasing the gantry
+            #     strap once the policy has full alpha and 2s of fresh
+            #     in-control observations in the proprioception buffer.
+            #
+            # Compare to --sim-profile gantry, which is the same start pose
+            # but holds the band on FOREVER (gantry-supported powered run,
+            # the test we're actually allowed to run on hardware before we
+            # bless the policy for free-standing operation).
             if [[ -n "$SIM_MOTION" ]]; then
-                echo -e "${YELLOW}[sim:handoff] ignoring --sim-motion (handoff starts at DEFAULT_DOF, not RSI)${NC}"
+                echo -e "${YELLOW}[sim:handoff] ignoring --sim-motion (handoff starts from a fixed gantry_hang pose, not RSI)${NC}"
                 SIM_MOTION=""
+            fi
+            if [[ -z "$SIM_INIT_POSE" ]]; then
+                SIM_INIT_POSE="gantry_hang"
+                echo -e "${BLUE}[sim:handoff]${NC} init pose: gantry_hang (firmware-stand, feet on floor, ~88% on band)"
             fi
             if [[ "$SIM_KEEP_ELASTIC_BAND" == "true" ]] \
                     || { [[ "$SIM_NO_ELASTIC_BAND" != "true" ]] \
@@ -714,7 +736,7 @@ if [[ "$MODE" == "sim" ]]; then
                 # Schedule band release for: ramp + 2s settle buffer.
                 SIM_BAND_RELEASE_AFTER_S="$(awk "BEGIN { print $local_ramp + 2.0 }")"
                 SIM_NO_ELASTIC_BAND=false
-                echo -e "${BLUE}[sim:handoff]${NC} elastic band: ON, auto-release ${SIM_BAND_RELEASE_AFTER_S}s after first deploy command (ramp + 2s settle)"
+                echo -e "${BLUE}[sim:handoff]${NC} elastic band: ON at gantry_hang's band_length, auto-release ${SIM_BAND_RELEASE_AFTER_S}s after first deploy command (ramp + 2s settle)"
             fi
             if [[ -z "$RAMP_SECONDS" ]]; then
                 echo -e "${BLUE}[sim:handoff]${NC} --ramp-seconds: deploy default (2.0s)"

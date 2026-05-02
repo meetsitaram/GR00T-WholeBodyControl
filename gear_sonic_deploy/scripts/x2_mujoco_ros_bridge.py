@@ -634,18 +634,22 @@ class X2MujocoRosBridge:
 
         Mirrors the 6-line block in ``gear_sonic/utils/mujoco_sim/base_sim.py``
         verbatim: build the [pos, quat, lin_vel, ang_vel] pose, run it through
-        ``ElasticBand.Advance``, and write to ``mj_data.xfrc_applied``. Headless
-        auto-release: once the deploy has been driving for
+        ``ElasticBand.Advance``, and write to ``mj_data.xfrc_applied``. Auto-
+        release: once the deploy has been driving for
         ``--band-release-after-s`` seconds we flip ``band.enable`` off so the
         robot drops onto its feet and the policy runs against gravity for real.
+        Operators who want to hold the body in mid-air for camera work pass
+        ``--band-release-after-s -1`` (never release); key 9 in the viewer
+        also toggles the band on/off interactively.
         """
         if self.elastic_band is None:
             return
-        # Headless auto-release. Viewer mode keeps the band on until the user
-        # presses key 9 (so they can enjoy the suspension).
+        # Auto-release applies in both headless and viewer modes -- when an
+        # automated profile (e.g. --sim-profile handoff) schedules a release,
+        # the viewer should faithfully show the body dropping when it would
+        # in real life. Holding the band on forever is opt-in via -1.
         if (
-            not self.args.viewer
-            and self.elastic_band.enable
+            self.elastic_band.enable
             and self._first_command_received
             and self.args.band_release_after_s >= 0.0
             and (time.monotonic() - self._first_command_mono)
