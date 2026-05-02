@@ -217,6 +217,30 @@ When sim-sim is sorted:
 
 ## Useful commands cheat sheet
 
+### Pre-flight before every powered run
+
+`deploy_x2.sh local` (and `onbot`) now invokes
+`gear_sonic_deploy/scripts/x2_preflight.py` automatically as part of
+Step 1/4, *before* the MC stop. A failing preflight aborts while MC
+is still holding the robot.
+
+Default behaviour (gantry bring-up): all pose / effort violations are
+WARN, not FAIL. Tighten for a floor-stand powered run:
+
+```bash
+./gear_sonic_deploy/deploy_x2.sh local \
+    --preflight-strict \
+    --preflight-args "--imu-tilt-deg 12 --max-effort 10" \
+    ... rest of args ...
+```
+
+Skip entirely (operator override, e.g. you've already run preflight
+manually and want to short-circuit a re-run):
+
+```bash
+./gear_sonic_deploy/deploy_x2.sh local --no-preflight-py ...
+```
+
 ### Powered run — current safest settings
 
 ```bash

@@ -144,6 +144,25 @@ NO_STOP_MC=false
 NO_CONFIRM=false
 NO_BUILD=false
 BUILD_ONLY=false
+# Real-robot pre-flight (gear_sonic_deploy/scripts/x2_preflight.py): the
+# gantry-aware safety check that validates topics + MC presence + joint
+# pose/vel/effort + IMU upright/quiet. Runs after the lightweight ros2
+# topic visibility check and BEFORE Safety Gate 1/2, so a failing
+# preflight aborts while MC is still holding the robot. Default ON for
+# real-robot modes, force-skipped in sim.
+NO_PREFLIGHT_PY=false
+# Pass --strict-pose --strict-effort to the preflight (promotes pose /
+# effort violations from WARN to FAIL). Default OFF for gantry bring-up
+# where any natural rest pose should not gate; flip ON for floor-stand
+# powered runs where the IC must be tight.
+PREFLIGHT_STRICT=false
+# Free-form extra args appended to the preflight invocation, e.g.
+#   --preflight-args "--max-effort 10 --imu-tilt-deg 12"
+# for an aggressive floor-stand bring-up. Empty by default (use
+# preflight script defaults). Quoted as a single string and word-split
+# at invocation time, so multi-flag passthroughs work without further
+# escaping.
+PREFLIGHT_ARGS=""
 
 # Sim mode (MuJoCo bridge is the only sim driver)
 SIM_DOMAIN_ID="$SIM_DOMAIN_ID_DEFAULT"
@@ -421,6 +440,18 @@ Pre-flight + behaviour toggles:
   --no-build                  Skip the colcon build step (use the existing
                               install/ tree as-is)
   --build-only                Build, don't run
+  --no-preflight-py           Skip the gantry-aware Python preflight
+                              (gear_sonic_deploy/scripts/x2_preflight.py).
+                              Default: preflight runs in local/onbot mode
+                              and is force-skipped in sim. Failures abort
+                              BEFORE MC stop, so the robot stays held.
+  --preflight-strict          Run the Python preflight with --strict-pose
+                              --strict-effort (promotes pose/effort WARNs
+                              to FAIL). Recommended for floor-stand powered
+                              runs; leave off for gantry bring-up.
+  --preflight-args "..."      Extra args appended verbatim to the Python
+                              preflight invocation (e.g.
+                              "--max-effort 10 --imu-tilt-deg 12").
 
 ONNX Runtime:
   --onnxruntime-root PATH     ORT install prefix (default: $ONNXRUNTIME_ROOT_DEFAULT)
@@ -482,6 +513,9 @@ while [[ $# -gt 0 ]]; do
         --no-confirm)         NO_CONFIRM=true; shift ;;
         --no-build)           NO_BUILD=true; shift ;;
         --build-only)         BUILD_ONLY=true; shift ;;
+        --no-preflight-py)    NO_PREFLIGHT_PY=true; shift ;;
+        --preflight-strict)   PREFLIGHT_STRICT=true; shift ;;
+        --preflight-args)     PREFLIGHT_ARGS="$2"; shift 2 ;;
         --sim-mjcf)               SIM_MJCF="$2"; shift 2 ;;
         --sim-motion)             SIM_MOTION="$2"; shift 2 ;;
         --sim-init-frame)         SIM_INIT_FRAME="$2"; shift 2 ;;
@@ -1035,6 +1069,49 @@ else
         fi
     else
         echo -e "${YELLOW}  ros2 not in PATH; skipping topic visibility check${NC}"
+    fi
+
+    # ────────────────────────────────────────────────────────────────
+    # Gantry-aware Python pre-flight. Runs the dedicated x2_preflight.py
+    # which audits joint pose/vel/effort, IMU upright/quiet, MC presence,
+    # and topic publishers. Heavyweight version of the lightweight ros2
+    # checks above. Placed BEFORE the MC stop on purpose: a failing
+    # preflight aborts while the robot is still held by MC.
+    # ────────────────────────────────────────────────────────────────
+    PREFLIGHT_SCRIPT="$SCRIPT_DIR/scripts/x2_preflight.py"
+    if $NO_PREFLIGHT_PY; then
+        echo -e "${YELLOW}  --no-preflight-py: skipping gantry-aware preflight${NC}"
+    elif [[ ! -f "$PREFLIGHT_SCRIPT" ]]; then
+        echo -e "${YELLOW}  preflight script not found at $PREFLIGHT_SCRIPT; skipping${NC}"
+    else
+        echo ""
+        echo -e "${BLUE}  Running gantry-aware preflight (x2_preflight.py) ...${NC}"
+        PREFLIGHT_CMD=("$SIM_PYTHON" "$PREFLIGHT_SCRIPT")
+        # Mirror IMU topic decision from the visibility check above so
+        # firmware shipping with the 'torse' typo doesn't false-fail.
+        if [[ -n "$IMU_TOPIC" ]]; then
+            PREFLIGHT_CMD+=("--imu-topic" "$IMU_TOPIC")
+        fi
+        if $PREFLIGHT_STRICT; then
+            PREFLIGHT_CMD+=("--strict-pose" "--strict-effort")
+        fi
+        if [[ -n "$PREFLIGHT_ARGS" ]]; then
+            # shellcheck disable=SC2206  # intentional word-split for passthrough
+            EXTRA_PREFLIGHT_ARGS=($PREFLIGHT_ARGS)
+            PREFLIGHT_CMD+=("${EXTRA_PREFLIGHT_ARGS[@]}")
+        fi
+        echo "    \$ ${PREFLIGHT_CMD[*]}"
+        if "${PREFLIGHT_CMD[@]}"; then
+            echo -e "${GREEN}  Preflight PASS.${NC}"
+        else
+            PREFLIGHT_RC=$?
+            echo -e "${RED}  Preflight FAILED (exit $PREFLIGHT_RC).${NC}"
+            echo -e "${YELLOW}  Aborting BEFORE MC stop; robot is unchanged.${NC}"
+            echo -e "${YELLOW}  Re-run with --preflight-args to relax thresholds, or${NC}"
+            echo -e "${YELLOW}  --no-preflight-py to bypass entirely (operator override).${NC}"
+            exit "$PREFLIGHT_RC"
+        fi
+        echo ""
     fi
 
     if ! $NO_STOP_MC; then
