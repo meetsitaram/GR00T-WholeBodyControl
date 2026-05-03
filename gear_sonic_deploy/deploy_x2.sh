@@ -50,7 +50,15 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+DIM='\033[2;37m'
 NC='\033[0m' # No Color
+
+# Millisecond-precision wall-clock timestamp for operational log lines.
+# Format: HH:MM:SS.mmm (24h, local TZ). Kept short so the colored tag
+# stays close to the message. Wrap usage as: echo -e "$(ts) ${BLUE}[tag]${NC} message".
+ts() {
+    printf '%s[%s]%s' "$DIM" "$(date +'%H:%M:%S.%3N')" "$NC"
+}
 
 # Script directory (where this script is located)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -266,6 +274,55 @@ INTRA_OP_THREADS=""
 # exit immediately. See compare_deploy_vs_isaaclab_obs.py for analysis.
 OBS_DUMP=""
 DRY_RUN=false
+
+# ────────────────────────────────────────────────────────────────────────
+# End-of-run smooth handoff (HOLD_FOR_MC).
+#
+# The deploy node has a HOLD_FOR_MC state that, after RAMP_OUT lands the
+# joints at MC's STAND_DEFAULT pose, keeps publishing that pose at the
+# captured MC kp/kd until MC retakes the joint command bus. The bash
+# wrapper sequences this end-of-run dance:
+#
+#   1. RAMP_OUT completes ->
+#      deploy node touches HOLD_FOR_MC_SENTINEL and enters HOLD_FOR_MC.
+#   2. The polling loop below sees the sentinel and POSTs start_app +
+#      SetMcAction(STAND_DEFAULT) WHILE the deploy node is still actively
+#      holding the pose. No zero-torque window.
+#   3. MC boots and starts publishing on /aima/hal/joint/{leg,waist}/command.
+#   4. The deploy node's MC-takeover detector sees a non-self publisher
+#      and exits cleanly. We `wait` on its PID for the final exit code.
+#
+# The sentinel file lives in $RUN_LOG_DIR (or /tmp as fallback). It is
+# unlinked on every entry to HOLD_FOR_MC by the deploy node and on every
+# exit from this script (cleanup trap), so a stale file from a previous
+# crashed run cannot mis-trigger the next run.
+#
+# STAND_POSE_YAML defaults to gear_sonic_deploy/configs/x2_stand_default_pose.yaml,
+# which is captured from MC by scripts/x2_capture_stand_pose.py (or by the
+# inline capture run from chat). HOLD_FOR_MC_TIMEOUT_S is the cap on how
+# long the deploy node will keep holding the pose if MC never comes back
+# (covers a failed start_app POST). Both are passthroughs to the C++
+# binary's --stand-default-pose / --hold-for-mc-timeout-s / --hold-for-mc-sentinel
+# flags. Set HOLD_FOR_MC_TIMEOUT_S=0 to disable HOLD_FOR_MC entirely
+# (legacy path: deploy exits on RAMP_OUT, bash starts MC after).
+STAND_POSE_YAML=""
+# 45 s default: MC's start_app + service rebind + PASSIVE-stable takes
+# ~10-12 s on PC1; we leave ~3x headroom so a slow boot doesn't trip the
+# safety cap. The hold itself is cheap (50 Hz writer, MC-stand gains),
+# so leaving it active longer has no cost.
+HOLD_FOR_MC_TIMEOUT_S="45"
+HOLD_FOR_MC_SENTINEL=""
+HOLD_FOR_MC_EXIT_SENTINEL=""
+MC_FIRST_PUBLISH_SENTINEL=""
+ESCALATOR_OK_SENTINEL=""
+ESCALATOR_PID=""
+# When true, abort with a friendly error if MC is not currently in
+# STAND_DEFAULT mode at script entry. The smooth handoff assumes MC is
+# alive and balancing the robot before we take the bus -- if MC is in
+# PASSIVE_DEFAULT or DAMPING_DEFAULT, the robot is already on the gantry
+# / floor with zero torque and there is nothing to "hand off" from.
+# Operator override: --no-require-stand-default.
+REQUIRE_STAND_DEFAULT=true
 
 # Behaviour toggles
 NO_STOP_MC=false
@@ -619,6 +676,26 @@ Pre-flight + behaviour toggles:
                               stopped, or you're using JOINT_DEFAULT mode).
                               The cleanup trap that restarts MC on exit is
                               also skipped in that case.
+  --no-require-stand-default  Bypass the pre-handoff gate that refuses to
+                              start unless MC is currently in STAND_DEFAULT.
+                              Use only if you know what you're doing -- the
+                              smooth handoff (RAMP_OUT to STAND_DEFAULT pose
+                              + HOLD_FOR_MC) assumes MC was actively
+                              balancing the robot before bash takes the bus.
+  --stand-pose-yaml PATH      YAML file capturing MC's STAND_DEFAULT pose
+                              (default: configs/x2_stand_default_pose.yaml).
+                              Forwarded to the deploy binary as
+                              --stand-default-pose; controls the RAMP_OUT
+                              + HOLD_FOR_MC target. Pass an empty string
+                              to fall back to default_angles (legacy snap-
+                              on-takeover behaviour).
+  --hold-for-mc-timeout-s N   Maximum time the deploy node will keep
+                              holding MC's STAND_DEFAULT pose after
+                              RAMP_OUT, waiting for MC to take back over
+                              the joint command bus (default 45). 0
+                              disables HOLD_FOR_MC entirely (legacy:
+                              deploy exits on RAMP_OUT, then bash starts
+                              MC -- there will be a zero-torque window).
   --no-confirm                Skip the final "proceed?" prompt (for CI)
   --no-build                  Skip the colcon build step (use the existing
                               install/ tree as-is)
@@ -698,6 +775,9 @@ while [[ $# -gt 0 ]]; do
         --target-lpf-hz)      TARGET_LPF_HZ="$2"; shift 2 ;;
         --action-clip)        ACTION_CLIP="$2"; shift 2 ;;
         --return-seconds)     RETURN_SECONDS="$2"; shift 2 ;;
+        --stand-pose-yaml)    STAND_POSE_YAML="$2"; shift 2 ;;
+        --hold-for-mc-timeout-s) HOLD_FOR_MC_TIMEOUT_S="$2"; shift 2 ;;
+        --no-require-stand-default) REQUIRE_STAND_DEFAULT=false; shift ;;
         --imu-topic)          IMU_TOPIC="$2"; shift 2 ;;
         --intra-op-threads)   INTRA_OP_THREADS="$2"; shift 2 ;;
         --obs-dump)           OBS_DUMP="$2"; shift 2 ;;
@@ -1197,6 +1277,84 @@ ROS2_ARGS=("--model" "$MODEL")
 [[ -n "$OBS_DUMP" ]]          && ROS2_ARGS+=("--obs-dump" "$OBS_DUMP")
 $DRY_RUN                      && ROS2_ARGS+=("--dry-run")
 
+# ────────────────────────────────────────────────────────────────────────
+# Smooth-handoff flags: only meaningful for real-robot modes (local/onbot).
+# In sim mode there is no MC to hand off to; the bridge owns the bus the
+# whole time, so HOLD_FOR_MC + the stand-pose YAML would be no-ops.
+# ────────────────────────────────────────────────────────────────────────
+if [[ "$MODE" != "sim" ]]; then
+    if [[ -z "$STAND_POSE_YAML" ]]; then
+        # Default to the captured pose shipped in the repo. The C++ binary
+        # falls back to default_angles if the file is missing, but it also
+        # logs a loud warning -- so this default minimises the takeover
+        # snap on the common case (operator just runs ./deploy_x2.sh local).
+        STAND_POSE_YAML="$SCRIPT_DIR/configs/x2_stand_default_pose.yaml"
+    fi
+    if [[ -f "$STAND_POSE_YAML" ]]; then
+        ROS2_ARGS+=("--stand-default-pose" "$STAND_POSE_YAML")
+    else
+        echo -e "${YELLOW}NOTE: --stand-pose-yaml '$STAND_POSE_YAML' not found;${NC}"
+        echo -e "${YELLOW}      deploy node will fall back to default_angles for HOLD_FOR_MC.${NC}"
+    fi
+    if [[ -n "$HOLD_FOR_MC_TIMEOUT_S" && "$HOLD_FOR_MC_TIMEOUT_S" != "0" ]]; then
+        ROS2_ARGS+=("--hold-for-mc-timeout-s" "$HOLD_FOR_MC_TIMEOUT_S")
+        # Sentinel goes in $RUN_LOG_DIR if available (per-run dir; gets
+        # cleaned up automatically by the run-recorder lifecycle), else
+        # /tmp keyed by PID. Either way the deploy node's
+        # ClearHoldForMcSentinel + this script's cleanup trap rm -f it.
+        if [[ -n "${RUN_LOG_DIR:-}" && -d "$RUN_LOG_DIR" ]]; then
+            HOLD_FOR_MC_SENTINEL="$RUN_LOG_DIR/hold_for_mc.sentinel"
+            HOLD_FOR_MC_EXIT_SENTINEL="$RUN_LOG_DIR/hold_for_mc_exit.sentinel"
+            MC_FIRST_PUBLISH_SENTINEL="$RUN_LOG_DIR/mc_first_publish.sentinel"
+        else
+            HOLD_FOR_MC_SENTINEL="/tmp/x2_hold_for_mc.$$.sentinel"
+            HOLD_FOR_MC_EXIT_SENTINEL="/tmp/x2_hold_for_mc_exit.$$.sentinel"
+            MC_FIRST_PUBLISH_SENTINEL="/tmp/x2_mc_first_publish.$$.sentinel"
+        fi
+        rm -f "$HOLD_FOR_MC_SENTINEL" "$HOLD_FOR_MC_EXIT_SENTINEL" \
+              "$MC_FIRST_PUBLISH_SENTINEL"
+        ROS2_ARGS+=("--hold-for-mc-sentinel" "$HOLD_FOR_MC_SENTINEL")
+        ROS2_ARGS+=("--hold-for-mc-exit-sentinel" "$HOLD_FOR_MC_EXIT_SENTINEL")
+        ROS2_ARGS+=("--mc-first-publish-sentinel" "$MC_FIRST_PUBLISH_SENTINEL")
+    fi
+
+    # ────────────────────────────────────────────────────────────────────
+    # STANDBY pre-launch: spawn the C++ binary in a writer-suppressed
+    # state BEFORE the safety gate so colcon build / DDS discovery /
+    # ONNX load happen in parallel with the operator reading the prompt.
+    # On 'Y', bash POSTs stop_app + verifies, then touches the trigger
+    # sentinel; deploy advances STANDBY -> INIT -> WAIT -> CONTROL on
+    # the next OnControl tick. End-to-end "Y -> CONTROL" lands at ~1 s
+    # instead of ~14 s (1 s stop_app + 7 s build + 5 s autostart).
+    # See the X2Deploy::State doc-comment for state-machine details.
+    #
+    # Skipped when --no-stop-mc is set (we never POST stop_app, so the
+    # trigger sentinel would never fire and deploy would sit in STANDBY
+    # forever). In that case fall back to the legacy boot-straight-to-
+    # INIT path.
+    # ────────────────────────────────────────────────────────────────────
+    if ! $NO_STOP_MC; then
+        if [[ -n "${RUN_LOG_DIR:-}" && -d "$RUN_LOG_DIR" ]]; then
+            START_TRIGGER_SENTINEL="$RUN_LOG_DIR/start_trigger.sentinel"
+            READY_SENTINEL="$RUN_LOG_DIR/ready.sentinel"
+        else
+            START_TRIGGER_SENTINEL="/tmp/x2_start_trigger.$$.sentinel"
+            READY_SENTINEL="/tmp/x2_ready.$$.sentinel"
+        fi
+        rm -f "$START_TRIGGER_SENTINEL" "$READY_SENTINEL"
+        ROS2_ARGS+=("--start-trigger-sentinel" "$START_TRIGGER_SENTINEL")
+        ROS2_ARGS+=("--ready-sentinel" "$READY_SENTINEL")
+        # Force --autostart-after to 0 in the bg-launch path: once the
+        # trigger sentinel fires, deploy should fall through STANDBY ->
+        # INIT (immediate, state already fresh from MC's continuous
+        # broadcasts) -> WAIT_FOR_CONTROL -> CONTROL with no extra dwell.
+        # Any user-supplied --autostart-after on the CLI still appears
+        # earlier in ROS2_ARGS; the deploy parser is last-write-wins so
+        # this 0 takes precedence.
+        ROS2_ARGS+=("--autostart-after" "0")
+    fi
+fi
+
 # ---------------------------------------------------------------------------
 # Real-deploy tuning preset expansion (--tuning-config PATH.yaml).
 #
@@ -1250,7 +1408,7 @@ if [[ -n "$TUNING_CONFIG" ]]; then
         ROS2_ARGS=("${ROS2_ARGS[0]}" "${ROS2_ARGS[1]}" \
                    "${TUNING_ARGS[@]}" \
                    "${ROS2_ARGS[@]:2}")
-        echo -e "${GREEN}[tuning]${NC} loaded $(basename "$TUNING_CONFIG"): " \
+        echo -e "$(ts) ${GREEN}[tuning]${NC} loaded $(basename "$TUNING_CONFIG"): " \
                 "${TUNING_ARGS[*]}"
     fi
 fi
@@ -1292,6 +1450,394 @@ PY
     fi
 }
 
+# ────────────────────────────────────────────────────────────────────────
+# MC mode helpers (smooth handoff). These wrap the existing stop_app /
+# start_app HTTP path with a SetMcAction(DAMPING_DEFAULT) before stop and a
+# SetMcAction(STAND_DEFAULT) after start, so the bus transitions are
+# softer:
+#
+#   STAND  -> DAMPING -> stop_app -> deploy publishes -> ...
+#   ... -> RAMP_OUT -> start_app -> wait MC up -> STAND
+#
+# Without these wraps:
+#   - stop_app from STAND_DEFAULT cuts the PD-balancing instantly. Motors
+#     drop to zero stiffness in one step => visible jolt on the gantry.
+#   - start_app boots MC into whatever its default mode is; not deterministic.
+#
+# Helpers below match the recipe used by scripts/x2_mc_mode_probe.sh: 250 ms
+# timeout per service call, a few retries, parse action_desc out of the
+# YAML response. Skipped if ros2 is unavailable on the current shell (host
+# without ROS sourced); the deploy still works -- you just lose the smooth
+# wrap.
+# ────────────────────────────────────────────────────────────────────────
+MC_SETMC_SVC="/aimdk_5Fmsgs/srv/SetMcAction"
+MC_GETMC_SVC="/aimdk_5Fmsgs/srv/GetMcAction"
+# Bumped from 0.5s to 3.0s after the iter-16k_180_lpf5 run on 2026-05-03
+# logged "SetMcAction did not confirm" and "GetMcAction never responded
+# after start_app". The empirical pnc-heartbeat probes used 3s and never
+# saw a hang, so the original 0.5s was simply too tight for a freshly-
+# booted MC where the service-discovery side of DDS hasn't fully
+# propagated yet. 3s gives MC time to respond without making interactive
+# waits feel sluggish.
+MC_SET_TIMEOUT_S="${MC_SET_TIMEOUT_S:-3.0}"
+MC_SET_RETRIES="${MC_SET_RETRIES:-6}"
+
+mc_get_action() {
+    # Print the current MC mode string on stdout, or empty on failure.
+    #
+    # The ROS 2 CLI may emit either YAML ('action_desc: STAND_DEFAULT') or
+    # Python-repr ("action_desc='STAND_DEFAULT'") depending on rclpy
+    # version. Parse both. (The pnc-heartbeat probe found this out the
+    # hard way; see scratch/probes/mc_input_source_*/FINDINGS_addendum.md.)
+    if ! command -v ros2 &>/dev/null; then
+        return 1
+    fi
+    local out=""
+    local n="${1:-$MC_SET_RETRIES}"
+    for _ in $(seq 1 "$n"); do
+        out=$(timeout "$MC_SET_TIMEOUT_S" \
+                ros2 service call "$MC_GETMC_SVC" \
+                aimdk_msgs/srv/GetMcAction \
+                "{request: {}}" 2>/dev/null) || true
+        if [[ -n "$out" ]]; then
+            local mode=""
+            # Python-repr form: action_desc='STAND_DEFAULT'
+            mode=$(echo "$out" | grep -oE "action_desc='[^']*'" \
+                   | head -1 | sed "s/.*action_desc='//; s/'$//")
+            # YAML form: action_desc: STAND_DEFAULT
+            if [[ -z "$mode" ]]; then
+                mode=$(echo "$out" | awk -F': ' '
+                    /action_desc:/ {
+                        gsub(/[\r\n"\047]/, "", $2)
+                        gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2)
+                        if ($2 != "") { print $2; exit }
+                    }')
+            fi
+            if [[ -n "$mode" ]]; then
+                echo "$mode"
+                return 0
+            fi
+        fi
+        sleep 0.2
+    done
+    return 1
+}
+
+mc_set_action() {
+    # $1 = mode string (e.g. STAND_DEFAULT, DAMPING_DEFAULT). Returns 0 on
+    # accepted reply (response.header.code == 0), 1 on exhausted retries /
+    # no ros2.
+    #
+    # The actual aimdk_msgs/srv/SetMcAction schema is:
+    #   Request: { header: RequestHeader, source: string,
+    #              command: McActionCommand { action: McAction,
+    #                                         action_desc: string } }
+    #   Response: { response: CommonResponse }   (header.code = 0 on OK)
+    #
+    # The pre-2026-05-03 payload of {request: {action_desc: ...}} silently
+    # NO-OP'd (the MC service ignored the unknown 'request' field, leaving
+    # all required fields default-filled, which decoded to action_desc=''
+    # and was rejected with a non-zero header.code). The deploy log then
+    # showed "did not confirm" but the run continued. Verified against
+    # /ros2_ws/install/aimdk_msgs/share/aimdk_msgs/srv/SetMcAction.srv.
+    local mode="$1"
+    if ! command -v ros2 &>/dev/null; then
+        return 1
+    fi
+    local n="${2:-$MC_SET_RETRIES}"
+    local payload
+    payload=$(printf "{header: {}, source: deploy_x2, command: {action_desc: '%s'}}" "$mode")
+    local out
+    for _ in $(seq 1 "$n"); do
+        out=$(timeout "$MC_SET_TIMEOUT_S" \
+                ros2 service call "$MC_SETMC_SVC" \
+                aimdk_msgs/srv/SetMcAction \
+                "$payload" 2>/dev/null) || true
+        # Success: response carries header.code=0. The python-repr ROS 2
+        # CLI output includes that as 'code=0' on a single line; we also
+        # accept the YAML form 'code: 0' for forward compat.
+        if echo "$out" | grep -q -E '(code=0|code:\s*0)'; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
+
+# Pre-handoff: bring MC down softly. Returns 0 if the SetMcAction call
+# landed (or ros2 isn't available), so the caller can still proceed to
+# stop_app even when the wrap is unsupported.
+mc_pre_handoff_damp() {
+    if ! command -v ros2 &>/dev/null; then
+        echo -e "${YELLOW}  (smooth-handoff skipped: ros2 not on PATH)${NC}"
+        return 0
+    fi
+    local from
+    from=$(mc_get_action 1 || true)
+    if [[ -n "$from" ]]; then
+        echo -e "${BLUE}  Pre-handoff:${NC} MC mode = $from -> DAMPING_DEFAULT"
+    else
+        echo -e "${BLUE}  Pre-handoff:${NC} MC mode = (unknown) -> DAMPING_DEFAULT"
+    fi
+    if mc_set_action DAMPING_DEFAULT; then
+        # Brief settle window for MC's internal mode transition. 500 ms is
+        # plenty given the per-mode latencies we observed in mode-probe
+        # (worst-case ~150 ms).
+        sleep 0.5
+        echo -e "${GREEN}  Pre-handoff: MC in DAMPING_DEFAULT.${NC}"
+        return 0
+    else
+        echo -e "${YELLOW}  Pre-handoff: SetMcAction(DAMPING_DEFAULT) did not confirm.${NC}"
+        echo -e "${YELLOW}  Falling back to direct stop_app (legacy behaviour).${NC}"
+        return 1
+    fi
+}
+
+# ────────────────────────────────────────────────────────────────────────
+# Pre-handoff helper: drive MC to STAND_DEFAULT through the legal mode
+# chain, asking the operator to confirm each transition.
+#
+# Mode chain (verified empirically via x2_mc_mode_probe.sh):
+#
+#   <unreachable>     ─ start_app via PC1 EM HTTP API
+#         │             (use when a previous run crashed mid-handoff and
+#         │              left MC's process down)
+#         ▼
+#   PASSIVE_DEFAULT   ─ SetMcAction(JOINT_DEFAULT)
+#   (zero torque,       (gated by MC's posture detector! if the robot is
+#    joints limp)        crouched into a 'sit' posture, the transition is
+#         │              rejected. Operator fix: raise the gantry until
+#         │              the robot is upright, then retry.)
+#         ▼
+#   JOINT_DEFAULT     ─ SetMcAction(STAND_DEFAULT)
+#   (active joints,     (active balancing; resists sideways pushes)
+#    no balancing)
+#         │
+#         ▼            ─ also reachable from DAMPING_DEFAULT
+#   STAND_DEFAULT       (which is the mode mc_pre_handoff_damp transitions
+#                        through on its way to stop_app)
+#
+# The function returns 0 on success (= MC is in STAND_DEFAULT), 1 if the
+# operator declines or the chain breaks. --no-confirm skips the prompts
+# but still walks the chain.
+# ────────────────────────────────────────────────────────────────────────
+escalate_mc_to_stand_default() {
+    if ! command -v ros2 &>/dev/null; then
+        echo -e "${YELLOW}  (mode escalation skipped: ros2 not on PATH)${NC}"
+        return 1
+    fi
+
+    local current_mode=""
+    current_mode="$(mc_get_action 3 2>/dev/null || true)"
+
+    # ── Step 0: MC unreachable -> POST start_app, wait for services. ──
+    if [[ -z "$current_mode" ]]; then
+        echo -e "${YELLOW}  MC is not responding to GetMcAction on $MC_GETMC_SVC.${NC}"
+        echo -e "${YELLOW}  This typically means the MC process is stopped (a previous run${NC}"
+        echo -e "${YELLOW}  may have crashed mid-handoff). We can POST start_app to PC1${NC}"
+        echo -e "${YELLOW}  ($MC_EM_URL) to bring it back. The robot stays at zero torque${NC}"
+        echo -e "${YELLOW}  until MC re-attaches and you switch it to STAND_DEFAULT.${NC}"
+        if ! $NO_CONFIRM; then
+            read -p "$(echo -e ${YELLOW}Try POSTing start_app to bring MC back up? [y/N]: ${NC})" yn
+            if [[ ! "$yn" =~ ^[Yy]$ ]]; then
+                echo -e "${YELLOW}  Declined. Resolve manually before re-running.${NC}"
+                return 1
+            fi
+        fi
+        if ! mc_em_post start_app; then
+            echo -e "${RED}  start_app POST to $MC_EM_URL/json/start_app failed.${NC}"
+            echo -e "${YELLOW}  Possible causes:${NC}"
+            echo -e "${YELLOW}    - host has no route to 10.0.1.40 (check enp10s0 IP)${NC}"
+            echo -e "${YELLOW}    - PC1 Environment Manager is down${NC}"
+            return 1
+        fi
+        echo "  Waiting up to 30 s for MC services to come back ..."
+        local i
+        for i in $(seq 1 60); do
+            current_mode="$(mc_get_action 1 2>/dev/null || true)"
+            if [[ -n "$current_mode" ]]; then break; fi
+            sleep 0.5
+        done
+        if [[ -z "$current_mode" ]]; then
+            echo -e "${RED}  MC services never came up after start_app (waited 30 s).${NC}"
+            echo -e "${YELLOW}  Check 'docker logs' on PC1 or ssh in and inspect MC.${NC}"
+            return 1
+        fi
+        echo -e "${GREEN}  MC came back up in $current_mode.${NC}"
+    fi
+
+    # ── Already in STAND_DEFAULT: nothing to do. ──
+    if [[ "$current_mode" == "STAND_DEFAULT" ]]; then
+        return 0
+    fi
+
+    # ── Step 1: PASSIVE_DEFAULT -> JOINT_DEFAULT (gated by posture). ──
+    if [[ "$current_mode" == "PASSIVE_DEFAULT" ]]; then
+        echo -e "${YELLOW}  MC is in PASSIVE_DEFAULT (zero torque, joints fully limp).${NC}"
+        echo -e "${YELLOW}  To resume active control we need to walk MC through:${NC}"
+        echo -e "${YELLOW}    PASSIVE_DEFAULT -> JOINT_DEFAULT -> STAND_DEFAULT${NC}"
+        echo -e "${YELLOW}  JOINT_DEFAULT activates the joints (no balancing). MC's posture${NC}"
+        echo -e "${YELLOW}  detector will REJECT this transition if the robot is currently${NC}"
+        echo -e "${YELLOW}  crouched into a 'sit' posture (knees deeply bent, pelvis low).${NC}"
+        echo -e "${YELLOW}  Confirm BEFORE proceeding:${NC}"
+        echo -e "${YELLOW}    [ ] Robot is firmly supported on the gantry${NC}"
+        echo -e "${YELLOW}    [ ] Pelvis is roughly at standing height (knees not deeply bent)${NC}"
+        echo -e "${YELLOW}    [ ] Joints will TENSE UP when JOINT_DEFAULT engages${NC}"
+        if ! $NO_CONFIRM; then
+            read -p "$(echo -e ${YELLOW}Switch MC to JOINT_DEFAULT? [y/N]: ${NC})" yn
+            if [[ ! "$yn" =~ ^[Yy]$ ]]; then
+                echo -e "${YELLOW}  Declined. Robot stays in PASSIVE_DEFAULT.${NC}"
+                return 1
+            fi
+        fi
+        if ! mc_set_action JOINT_DEFAULT; then
+            echo -e "${RED}  SetMcAction(JOINT_DEFAULT) was rejected.${NC}"
+            echo -e "${YELLOW}  Most likely cause: MC's posture detector classified the robot${NC}"
+            echo -e "${YELLOW}  as 'sit' (we have hit this exact failure before -- see${NC}"
+            echo -e "${YELLOW}  scratch/probes/mc_input_source_*/FINDINGS_addendum.md).${NC}"
+            echo -e "${YELLOW}  Recovery:${NC}"
+            echo -e "${YELLOW}    1. Raise the gantry so the robot's pelvis is higher and${NC}"
+            echo -e "${YELLOW}       the knees are less bent.${NC}"
+            echo -e "${YELLOW}    2. Re-run this script (the gate will re-attempt).${NC}"
+            return 1
+        fi
+        echo -e "${GREEN}  -> JOINT_DEFAULT.${NC}"
+        sleep 0.5
+        # Re-read so we walk the next step from the actual current mode.
+        current_mode="$(mc_get_action 2 2>/dev/null || echo JOINT_DEFAULT)"
+    fi
+
+    # ── Step 2: anything-other-than-STAND -> STAND_DEFAULT. ──
+    # Reachable from JOINT_DEFAULT (Step 1 fall-through) and from
+    # DAMPING_DEFAULT (operator hit damping on the mobile app, etc.).
+    if [[ "$current_mode" != "STAND_DEFAULT" ]]; then
+        echo -e "${YELLOW}  MC is in $current_mode. Switching to STAND_DEFAULT for active${NC}"
+        echo -e "${YELLOW}  balancing -- the robot will start resisting sideways pushes${NC}"
+        echo -e "${YELLOW}  the moment this lands. Make sure the gantry has slack.${NC}"
+        if ! $NO_CONFIRM; then
+            read -p "$(echo -e ${YELLOW}Switch MC to STAND_DEFAULT? [y/N]: ${NC})" yn
+            if [[ ! "$yn" =~ ^[Yy]$ ]]; then
+                echo -e "${YELLOW}  Declined. Robot stays in $current_mode.${NC}"
+                return 1
+            fi
+        fi
+        if ! mc_set_action STAND_DEFAULT; then
+            echo -e "${RED}  SetMcAction(STAND_DEFAULT) was rejected.${NC}"
+            echo -e "${YELLOW}  If you came from PASSIVE/JOINT, raise the gantry as above.${NC}"
+            echo -e "${YELLOW}  If you came from DAMPING_DEFAULT, MC may be in a fault state${NC}"
+            echo -e "${YELLOW}  -- check the mobile app for any red indicators.${NC}"
+            return 1
+        fi
+        echo -e "${GREEN}  -> STAND_DEFAULT.${NC}"
+        sleep 0.5
+    fi
+
+    # ── Step 3: confirm we landed where we expected. ──
+    current_mode="$(mc_get_action 3 2>/dev/null || true)"
+    if [[ "$current_mode" == "STAND_DEFAULT" ]]; then
+        return 0
+    fi
+    echo -e "${RED}  After escalation MC is in '${current_mode:-<unknown>}', not STAND_DEFAULT.${NC}"
+    return 1
+}
+
+# Non-interactive variant of escalate_mc_to_stand_default for use mid-
+# handoff, when the deploy node is actively holding the robot in MC's
+# stand pose and we just POSTed start_app. The deploy can hold for at
+# most --hold-for-mc-timeout-s seconds (default 45) before it bails, so
+# we cannot block on operator confirmations here -- the robot literally
+# falls (well, the deploy stops driving it) if we sit at a y/N prompt.
+# Walks PASSIVE -> JOINT_DEFAULT -> STAND_DEFAULT (or DAMPING -> STAND).
+# Returns 0 when MC is in STAND_DEFAULT, 1 otherwise.
+mc_post_policy_escalate_to_stand() {
+    if ! command -v ros2 &>/dev/null; then return 1; fi
+    # Wait up to 30 s for MC services to come back after start_app.
+    local i mode=""
+    for i in $(seq 1 60); do
+        mode="$(mc_get_action 1 2>/dev/null || true)"
+        [[ -n "$mode" ]] && break
+        sleep 0.5
+    done
+    if [[ -z "$mode" ]]; then
+        echo -e "$(ts) ${RED}[post-handoff]${NC} MC services never came up after start_app."
+        return 1
+    fi
+    echo -e "$(ts) ${BLUE}[post-handoff]${NC} MC came back up in $mode."
+
+    # PASSIVE -> JOINT_DEFAULT (the robot is being held upright by the
+    # deploy node, so the posture detector should accept this).
+    # NOTE: SetMcAction blocks until MC accepts/rejects, so no sleep is
+    # needed afterwards. Skipping the sleep minimises the JOINT_DEFAULT
+    # window where MC and deploy briefly publish in parallel (deploy kp
+    # vs MC kp = motor whir if the gains differ). Goal is to be in
+    # JOINT only as long as it takes to send the next service call.
+    if [[ "$mode" == "PASSIVE_DEFAULT" ]]; then
+        if mc_set_action JOINT_DEFAULT; then
+            echo -e "$(ts) ${GREEN}[post-handoff]${NC} -> JOINT_DEFAULT."
+            mode="JOINT_DEFAULT"
+        else
+            echo -e "$(ts) ${RED}[post-handoff]${NC} SetMcAction(JOINT_DEFAULT) was rejected."
+            echo -e "${YELLOW}  Robot is currently held by deploy node; you have ~30 s${NC}"
+            echo -e "${YELLOW}  before HOLD_FOR_MC times out. Switch via the mobile app.${NC}"
+            return 1
+        fi
+    fi
+
+    # JOINT_DEFAULT or DAMPING_DEFAULT -> STAND_DEFAULT (back-to-back
+    # with the JOINT call -- no intervening sleep, see comment above).
+    if [[ "$mode" != "STAND_DEFAULT" ]]; then
+        if mc_set_action STAND_DEFAULT; then
+            echo -e "$(ts) ${GREEN}[post-handoff]${NC} -> STAND_DEFAULT."
+        else
+            echo -e "$(ts) ${RED}[post-handoff]${NC} SetMcAction(STAND_DEFAULT) was rejected."
+            return 1
+        fi
+    fi
+
+    # Final verify (this is the only place we wait for MC to settle: the
+    # SetMcAction service call returned, but MC's mode publisher catches
+    # up a few ms later).
+    mode="$(mc_get_action 3 2>/dev/null || true)"
+    if [[ "$mode" == "STAND_DEFAULT" ]]; then
+        return 0
+    fi
+    echo -e "$(ts) ${RED}[post-handoff]${NC} After escalation MC is in '${mode:-<unknown>}'."
+    return 1
+}
+
+# Post-handoff: after start_app, wait for MC to expose its services again,
+# then ask it to STAND_DEFAULT. Best-effort -- failure is logged but does
+# not abort the cleanup. If ros2 isn't available we just skip the STAND
+# request and rely on MC's default boot mode.
+mc_post_handoff_stand() {
+    if ! command -v ros2 &>/dev/null; then
+        echo -e "${YELLOW}  (post-handoff skipped: ros2 not on PATH)${NC}"
+        return 0
+    fi
+    # Poll until GetMcAction responds (MC has finished booting back up).
+    local i mode=""
+    for i in $(seq 1 30); do
+        if mode=$(mc_get_action 1 2>/dev/null); then
+            break
+        fi
+        sleep 0.5
+    done
+    if [[ -z "$mode" ]]; then
+        echo -e "${YELLOW}  Post-handoff: GetMcAction never responded after start_app${NC}"
+        echo -e "${YELLOW}  (waited ~15s). Robot left in whatever mode MC booted into.${NC}"
+        return 1
+    fi
+    echo -e "${BLUE}  Post-handoff:${NC} MC came back up in $mode. Requesting STAND_DEFAULT ..."
+    if mc_set_action STAND_DEFAULT; then
+        echo -e "${GREEN}  Post-handoff: MC -> STAND_DEFAULT.${NC}"
+        return 0
+    else
+        echo -e "${YELLOW}  Post-handoff: SetMcAction(STAND_DEFAULT) did not confirm.${NC}"
+        echo -e "${YELLOW}  Robot stays in $mode; switch from the mobile app if needed.${NC}"
+        return 1
+    fi
+}
+
 start_run_recorder() {
     # Background the npz recorder. Called from the launch step (before the
     # mode branching) so the recording covers WAIT -> CONTROL -> RAMP_OUT.
@@ -1299,11 +1845,11 @@ start_run_recorder() {
     if ! $RECORD_RUN; then return 0; fi
     local recorder="$SCRIPT_DIR/scripts/x2_record_real_run.py"
     if [[ ! -f "$recorder" ]]; then
-        echo -e "${YELLOW}[record] $recorder not found; skipping --record${NC}" >&2
+        echo -e "$(ts) ${YELLOW}[record]${NC} $recorder not found; skipping --record" >&2
         return 0
     fi
     mkdir -p "$(dirname "$RECORD_OUT")"
-    echo -e "${BLUE}[record]${NC} backgrounding recorder -> $RECORD_OUT"
+    echo -e "$(ts) ${BLUE}[record]${NC} backgrounding recorder -> $RECORD_OUT"
     # --quiet keeps the 1 Hz status line out of the deploy's terminal output.
     # Use scripts/x2_record_real_run.py --summarize PATH.npz after the run
     # to pull the analysis. Inheriting our shell's ROS env (sourced by the
@@ -1316,7 +1862,7 @@ start_run_recorder() {
     RUN_RECORD_PID=$!
     sleep 0.5
     if ! kill -0 "$RUN_RECORD_PID" 2>/dev/null; then
-        echo -e "${YELLOW}[record] recorder exited immediately; check rclpy/aimdk_msgs${NC}" >&2
+        echo -e "$(ts) ${YELLOW}[record]${NC} recorder exited immediately; check rclpy/aimdk_msgs" >&2
         RUN_RECORD_PID=""
     fi
 }
@@ -1324,10 +1870,10 @@ start_run_recorder() {
 stop_run_recorder() {
     [[ -z "$RUN_RECORD_PID" ]] && return 0
     if kill -0 "$RUN_RECORD_PID" 2>/dev/null; then
-        echo -e "${BLUE}[cleanup]${NC} stopping run recorder (pid $RUN_RECORD_PID) ..."
+        echo -e "$(ts) ${BLUE}[cleanup]${NC} stopping run recorder (pid $RUN_RECORD_PID) ..."
         kill -INT "$RUN_RECORD_PID" 2>/dev/null || true
         wait "$RUN_RECORD_PID" 2>/dev/null || true
-        echo -e "${GREEN}[cleanup]${NC} recorder finalized: $RECORD_OUT"
+        echo -e "$(ts) ${GREEN}[cleanup]${NC} recorder finalized: $RECORD_OUT"
     fi
     RUN_RECORD_PID=""
 }
@@ -1336,12 +1882,12 @@ cleanup_sim() {
     local rc=$?
     if [[ -n "$SIM_BRIDGE_PID" ]] && kill -0 "$SIM_BRIDGE_PID" 2>/dev/null; then
         echo ""
-        echo -e "${BLUE}[cleanup]${NC} stopping MuJoCo bridge (pid $SIM_BRIDGE_PID) ..."
+        echo -e "$(ts) ${BLUE}[cleanup]${NC} stopping MuJoCo bridge (pid $SIM_BRIDGE_PID) ..."
         kill -INT "$SIM_BRIDGE_PID" 2>/dev/null || true
         wait "$SIM_BRIDGE_PID" 2>/dev/null || true
     fi
     if [[ -n "$SIM_RECORD_PID" ]] && kill -0 "$SIM_RECORD_PID" 2>/dev/null; then
-        echo -e "${BLUE}[cleanup]${NC} stopping command bag recorder (pid $SIM_RECORD_PID) ..."
+        echo -e "$(ts) ${BLUE}[cleanup]${NC} stopping command bag recorder (pid $SIM_RECORD_PID) ..."
         kill -INT "$SIM_RECORD_PID" 2>/dev/null || true
         wait "$SIM_RECORD_PID" 2>/dev/null || true
     fi
@@ -1357,15 +1903,43 @@ restart_mc_on_exit() {
     # Stop the run recorder FIRST so it captures the deploy's RAMP_OUT and
     # the silence between deploy-exit and MC-restart in the same npz.
     stop_run_recorder
+    # Clear all sentinels so stale files from a crashed run cannot
+    # mis-trigger the next invocation. Best-effort.
+    if [[ -n "${HOLD_FOR_MC_SENTINEL:-}" ]]; then
+        rm -f "$HOLD_FOR_MC_SENTINEL"
+    fi
+    if [[ -n "${HOLD_FOR_MC_EXIT_SENTINEL:-}" ]]; then
+        rm -f "$HOLD_FOR_MC_EXIT_SENTINEL"
+    fi
+    if [[ -n "${MC_FIRST_PUBLISH_SENTINEL:-}" ]]; then
+        rm -f "$MC_FIRST_PUBLISH_SENTINEL"
+    fi
+    if [[ -n "${ESCALATOR_OK_SENTINEL:-}" ]]; then
+        rm -f "$ESCALATOR_OK_SENTINEL"
+    fi
+    if [[ -n "${ESCALATOR_PID:-}" ]] && kill -0 "$ESCALATOR_PID" 2>/dev/null; then
+        kill -TERM "$ESCALATOR_PID" 2>/dev/null || true
+        wait "$ESCALATOR_PID" 2>/dev/null || true
+    fi
+    if [[ -n "${START_TRIGGER_SENTINEL:-}" ]]; then
+        rm -f "$START_TRIGGER_SENTINEL"
+    fi
+    if [[ -n "${READY_SENTINEL:-}" ]]; then
+        rm -f "$READY_SENTINEL"
+    fi
     if $MC_STOPPED_BY_US; then
         # Mark first so a second SIGINT doesn't double-fire.
         MC_STOPPED_BY_US=false
         echo ""
-        echo -e "${BLUE}[cleanup]${NC} restarting MC on $MC_EM_URL ..."
+        echo -e "$(ts) ${BLUE}[cleanup]${NC} restarting MC on $MC_EM_URL ..."
         if mc_em_post start_app; then
-            echo -e "${GREEN}[cleanup]${NC} MC start_app POSTed."
+            echo -e "$(ts) ${GREEN}[cleanup]${NC} MC start_app POSTed."
+            # Smooth-handoff: wait for MC services to come back, then ask
+            # for STAND_DEFAULT so the robot ends up balancing again
+            # without operator intervention. Non-fatal on failure.
+            mc_post_handoff_stand || true
         else
-            echo -e "${RED}[cleanup]${NC} MC start_app HTTP failed."
+            echo -e "$(ts) ${RED}[cleanup]${NC} MC start_app HTTP failed."
             echo -e "${YELLOW}  Manually restart with:${NC}"
             echo -e "  curl -X POST $MC_EM_URL/json/start_app \\"
             echo -e "       -H 'Content-Type: application/json' -d '{\"app_name\":\"mc\"}'"
@@ -1379,7 +1953,7 @@ restart_mc_on_exit() {
 # ============================================================================
 
 if [[ "$MODE" == "sim" ]]; then
-    echo -e "${BLUE}[Step 1/4]${NC} Sim pre-flight"
+    echo -e "$(ts) ${BLUE}[Step 1/4]${NC} Sim pre-flight"
 
     echo "  Bridge script:     $SCRIPT_DIR/$SIM_BRIDGE_REL"
     echo -n "  Python interpreter ($SIM_PYTHON) ... "
@@ -1412,7 +1986,7 @@ PY
     export ROS_DOMAIN_ID="$SIM_DOMAIN_ID"
     echo ""
 else
-    echo -e "${BLUE}[Step 1/4]${NC} Robot pre-flight"
+    echo -e "$(ts) ${BLUE}[Step 1/4]${NC} Robot pre-flight"
 
     echo -n "  Pinging $ROBOT_HOST ... "
     if ping -c 1 -W 2 "$ROBOT_HOST" &>/dev/null; then
@@ -1498,71 +2072,65 @@ else
 
     if ! $NO_STOP_MC; then
         # ────────────────────────────────────────────────────────────────
-        # SAFETY GATE 1/2 -- before we silence the PD-hold controller.
+        # PRE-HANDOFF GATE: require MC in STAND_DEFAULT.
+        #
+        # Smooth handoff is built around the contract "we start in
+        # STAND_DEFAULT and we end in STAND_DEFAULT". If MC is currently
+        # in PASSIVE_DEFAULT / DAMPING_DEFAULT / a fault state, the
+        # robot is already on the gantry / floor with zero or low
+        # torque -- there is nothing to "hand off" from, and the
+        # captured stand-pose YAML (which assumes MC was actively
+        # balancing) is the wrong target. Refuse to proceed and tell
+        # the operator how to recover. Operator override:
+        # --no-require-stand-default.
         # ────────────────────────────────────────────────────────────────
-        echo ""
-        echo -e "${RED}═══════════════════════════════════════════════════════════════════════${NC}"
-        echo -e "${RED}  SAFETY GATE 1/2 -- STOPPING MC RELEASES THE PD-HOLD CONTROLLER${NC}"
-        echo -e "${RED}═══════════════════════════════════════════════════════════════════════${NC}"
-        echo ""
-        echo -e "${YELLOW}  About to POST stop_app to ${MC_EM_URL}.${NC}"
-        echo -e "${YELLOW}  Once MC stops, motors go passive -- gravity wins.${NC}"
-        echo ""
-        echo -e "${YELLOW}  Confirm BEFORE proceeding:${NC}"
-        echo -e "${YELLOW}    [ ] Robot is firmly supported (gantry / harness / hand-held)${NC}"
-        echo -e "${YELLOW}    [ ] No personnel within arm or leg reach of robot${NC}"
-        echo -e "${YELLOW}    [ ] You are ready for slight settling motion when MC releases${NC}"
-        if ! $DRY_RUN; then
-            echo -e "${RED}    [ ] E-stop is within reach (this is NOT a dry-run)${NC}"
-        fi
-        echo ""
-        echo -e "${BLUE}  The cleanup trap will POST start_app on script exit (Ctrl-C is safe).${NC}"
-        echo ""
-        if ! $NO_CONFIRM; then
-            read -p "$(echo -e ${RED}Stop MC now? [y/N]: ${NC})" mc_confirm
-            if [[ ! "$mc_confirm" =~ ^[Yy]$ ]]; then
-                echo -e "${YELLOW}  Cancelled before MC stop. Robot is unchanged.${NC}"
-                exit 0
+        if $REQUIRE_STAND_DEFAULT; then
+            echo ""
+            echo -n "  Pre-handoff: MC mode = "
+            CURRENT_MC_MODE="$(mc_get_action 3 2>/dev/null || true)"
+            if [[ -z "$CURRENT_MC_MODE" ]]; then
+                echo -e "${YELLOW}<unreachable>${NC}"
+            else
+                echo -e "${BLUE}$CURRENT_MC_MODE${NC}"
+            fi
+
+            if [[ "$CURRENT_MC_MODE" == "STAND_DEFAULT" ]]; then
+                echo -e "${GREEN}  Smooth-handoff contract satisfied: start in STAND_DEFAULT,${NC}"
+                echo -e "${GREEN}  end in STAND_DEFAULT (HOLD_FOR_MC bridges the gap).${NC}"
+            else
+                echo ""
+                echo -e "${YELLOW}  MC is not in STAND_DEFAULT. The smooth handoff requires MC${NC}"
+                echo -e "${YELLOW}  to be actively balancing the robot before we take the bus.${NC}"
+                echo -e "${YELLOW}  Walking MC up the mode chain to STAND_DEFAULT now (each${NC}"
+                echo -e "${YELLOW}  transition asks for confirmation).${NC}"
+                echo ""
+                if ! escalate_mc_to_stand_default; then
+                    echo ""
+                    echo -e "${RED}  ERROR: could not get MC into STAND_DEFAULT.${NC}" >&2
+                    echo -e "${YELLOW}  Resolve the issue above (gantry height, MC fault, etc.)${NC}" >&2
+                    echo -e "${YELLOW}  and re-run, OR bypass this gate with:${NC}" >&2
+                    echo -e "${YELLOW}    --no-require-stand-default${NC}" >&2
+                    echo -e "${YELLOW}  (only safe if you know the robot is in a recoverable state).${NC}" >&2
+                    exit 1
+                fi
+                echo ""
+                echo -e "${GREEN}  Smooth-handoff contract satisfied: start in STAND_DEFAULT,${NC}"
+                echo -e "${GREEN}  end in STAND_DEFAULT (HOLD_FOR_MC bridges the gap).${NC}"
             fi
         else
-            echo -e "${YELLOW}  --no-confirm: skipping safety gate 1/2${NC}"
+            echo -e "${YELLOW}  --no-require-stand-default: skipping STAND_DEFAULT gate${NC}"
         fi
-        echo ""
-        echo "  Stopping MC module via PC1 EM HTTP API ($MC_EM_URL) ..."
-        if ! mc_em_post stop_app; then
-            echo -e "${RED}  POST $MC_EM_URL/json/stop_app failed${NC}"
-            echo -e "${YELLOW}  Possible causes:${NC}"
-            echo -e "${YELLOW}    - host has no route to 10.0.1.40 (check enp10s0 IP / SDK cable)${NC}"
-            echo -e "${YELLOW}    - PC1 EM is not running${NC}"
-            echo -e "${YELLOW}    - MC is already stopped from a previous run (use --no-stop-mc)${NC}"
-            exit 1
-        fi
-        MC_STOPPED_BY_US=true
-        # Install the cleanup trap *only after* a successful stop, so we
-        # never accidentally start MC that we did not stop. Covers normal
-        # exit, Ctrl-C, SIGTERM. NOTE: this only works if the script does
-        # NOT exec the deploy binary (we drop the exec further down).
-        trap restart_mc_on_exit EXIT INT TERM
 
-        # Best-effort verify: MC publishes on /aima/hal/joint/arm/command
-        # at ~50 Hz; after stop the publisher count should drop to 0 within
-        # ~1s. Skip silently if ros2 isn't available (e.g. host shell with
-        # no ROS sourced; container shell will have it).
-        if command -v ros2 &>/dev/null; then
-            sleep 1
-            ARM_CMD_PUBS=$(timeout 3 ros2 topic info /aima/hal/joint/arm/command 2>/dev/null \
-                | awk '/Publisher count:/ {print $NF}')
-            if [[ "$ARM_CMD_PUBS" == "0" ]]; then
-                echo -e "${GREEN}  Verified: 0 publishers on /aima/hal/joint/arm/command.${NC}"
-            else
-                echo -e "${YELLOW}  Could not confirm MC stop (publisher count='${ARM_CMD_PUBS:-?}', expected 0).${NC}"
-                echo -e "${YELLOW}  Proceeding anyway -- the deploy will fight MC if it's still up.${NC}"
-            fi
-        fi
-        echo -e "${GREEN}  MC module stopped.${NC}"
+        # NOTE: the SAFETY GATE prompt + stop_app POST that used to live
+        # here have moved to Step 4 (after the colcon build), so we can
+        # spawn the deploy in STANDBY ahead of the prompt. With that
+        # reordering "Y -> CONTROL" goes from ~14 s (1 s stop_app + 7 s
+        # build + 5 s autostart) to ~1 s (stop_app + verify + sentinel
+        # touch + one OnControl tick). See do_stop_mc_and_trigger_deploy
+        # in this script for the post-build path.
+        :  # no-op; pre-handoff gate above stays as is
     else
-        echo -e "${YELLOW}  Skipping MC stop (--no-stop-mc).${NC}"
-        echo -e "${YELLOW}  Make sure MC is either stopped or in JOINT_DEFAULT mode.${NC}"
+        echo -e "${YELLOW}  --no-stop-mc: skipping STAND_DEFAULT pre-handoff gate${NC}"
     fi
     echo ""
 fi
@@ -1571,7 +2139,7 @@ fi
 # Step 2: Asset checks (--model and --motion exist where this script runs)
 # ============================================================================
 
-echo -e "${BLUE}[Step 2/4]${NC} Asset checks"
+echo -e "$(ts) ${BLUE}[Step 2/4]${NC} Asset checks"
 
 check_local_file() {
     if [[ -e "$1" ]]; then
@@ -1608,7 +2176,7 @@ echo ""
 # Step 3: Build (colcon)
 # ============================================================================
 
-echo -e "${BLUE}[Step 3/4]${NC} Build"
+echo -e "$(ts) ${BLUE}[Step 3/4]${NC} Build"
 
 build_local() {
     if $NO_BUILD; then
@@ -1692,7 +2260,7 @@ fi
 # Step 4: Display configuration + confirm + run
 # ============================================================================
 
-echo -e "${BLUE}[Step 4/4]${NC} Ready to launch"
+echo -e "$(ts) ${BLUE}[Step 4/4]${NC} Ready to launch"
 echo ""
 echo -e "${CYAN}═══════════════════════════════════════════════════════════════════════${NC}"
 echo -e "${CYAN}                       DEPLOYMENT CONFIGURATION                        ${NC}"
@@ -1771,49 +2339,43 @@ echo ""
 
 if [[ "$MODE" != "sim" ]]; then
     if $DRY_RUN; then
-        echo -e "${YELLOW}📋 DRY-RUN: pipeline runs but no torque will be applied.${NC}"
+        echo -e "$(ts) ${YELLOW}DRY-RUN${NC}: pipeline runs but no torque will be applied."
     else
-        echo -e "${RED}⚠️  WARNING: this will issue REAL torque commands to the X2 Ultra.${NC}"
-        echo -e "${RED}    Robot must be on a gantry / supported. E-stop within reach.${NC}"
+        echo -e "$(ts) ${RED}WARNING${NC}: this will issue REAL torque commands to the X2 Ultra."
+        echo -e "$(ts) ${RED}        ${NC} Robot must be on a gantry / supported. E-stop within reach."
     fi
 else
-    echo -e "${YELLOW}📋 SIM mode: closed-loop MuJoCo. Bridge applies the deploy's PD${NC}"
+    echo -e "${YELLOW}SIM mode: closed-loop MuJoCo. Bridge applies the deploy's PD${NC}"
     echo -e "${YELLOW}    commands as torques. Robot may fall if the policy isn't well-${NC}"
     echo -e "${YELLOW}    behaved -- that's the point. Use --sim-viewer to watch.${NC}"
 fi
 echo ""
 
+# Sim mode keeps a one-line confirmation here (it has no MC to stop, so
+# the merged gate that real-robot mode runs below doesn't apply).
+# Real-robot mode (local/onbot) goes through the bg-launch + sentinel
+# safety gate further down -- there is no separate confirmation here.
 if ! $NO_CONFIRM; then
-    if [[ "$MODE" != "sim" ]]; then
-        echo -e "${RED}═══════════════════════════════════════════════════════════════════════${NC}"
-        echo -e "${RED}  SAFETY GATE 2/2 -- LAUNCH POLICY${NC}"
-        echo -e "${RED}═══════════════════════════════════════════════════════════════════════${NC}"
-        if $DRY_RUN; then
-            echo -e "${YELLOW}  Dry-run: pipeline runs but stiffness/damping are zero --${NC}"
-            echo -e "${YELLOW}  no torque commanded. CSVs will log what WOULD have been sent.${NC}"
-        else
-            echo -e "${RED}  Powered: PD targets WILL be published to /aima/hal/joint/*/command${NC}"
-            echo -e "${RED}  at ~500 Hz. Soft-start ramp blends policy in over --ramp-seconds.${NC}"
+    if [[ "$MODE" == "sim" ]]; then
+        read -p "$(echo -e ${GREEN}Proceed with sim launch? [Y/n]: ${NC})" confirm
+        if [[ -n "$confirm" && ! "$confirm" =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}Cancelled before launch.${NC}"
+            exit 0
         fi
-        echo ""
-    fi
-    read -p "$(echo -e ${GREEN}Proceed with launch? [Y/n]: ${NC})" confirm
-    if [[ -n "$confirm" && ! "$confirm" =~ ^[Yy]$ ]]; then
-        echo -e "${YELLOW}Cancelled before launch. MC will be restarted by the cleanup trap.${NC}"
-        exit 0
     fi
 fi
 
 echo ""
-echo -e "${GREEN}🚀 Launching ...${NC}"
+echo -e "$(ts) ${GREEN}Launching ...${NC}"
 echo ""
 
 # --record: spin the npz recorder up BEFORE the deploy / bridge so the
-# recording covers the full WAIT -> CONTROL -> RAMP_OUT window. The cleanup
-# traps below (cleanup_sim for sim mode, restart_mc_on_exit for local/onbot)
-# both call stop_run_recorder so a clean .npz is dumped even on Ctrl-C.
-# In sim mode the bridge starts further down and the recorder picks up its
-# /aima publishers as soon as they appear -- no need to interleave starts.
+# recording covers the full STANDBY -> WAIT -> CONTROL -> RAMP_OUT window.
+# The cleanup traps below (cleanup_sim for sim mode, restart_mc_on_exit
+# for local/onbot) both call stop_run_recorder so a clean .npz is dumped
+# even on Ctrl-C. In sim mode the bridge starts further down and the
+# recorder picks up its /aima publishers as soon as they appear -- no
+# need to interleave starts.
 start_run_recorder
 
 if [[ "$MODE" == "onbot" ]]; then
@@ -1855,13 +2417,13 @@ elif [[ "$MODE" == "sim" ]]; then
     $SIM_VIEWER                          && BRIDGE_ARGS+=("--viewer")
     $SIM_PRINT_SCENE                     && BRIDGE_ARGS+=("--print-scene")
 
-    echo -e "${BLUE}[sim]${NC} backgrounding: $SIM_PYTHON $SIM_BRIDGE_REL ${BRIDGE_ARGS[*]}"
+    echo -e "$(ts) ${BLUE}[sim]${NC} backgrounding: $SIM_PYTHON $SIM_BRIDGE_REL ${BRIDGE_ARGS[*]}"
     "$SIM_PYTHON" "$SCRIPT_DIR/$SIM_BRIDGE_REL" "${BRIDGE_ARGS[@]}" &
     SIM_BRIDGE_PID=$!
     # cleanup_sim trap was installed above (before bridge launch).
 
     if [[ -n "$SIM_RECORD_COMMANDS" ]]; then
-        echo -e "${BLUE}[sim]${NC} backgrounding: ros2 bag record -> $SIM_RECORD_COMMANDS"
+        echo -e "$(ts) ${BLUE}[sim]${NC} backgrounding: ros2 bag record -> $SIM_RECORD_COMMANDS"
         ros2 bag record -o "$SIM_RECORD_COMMANDS" \
             /aima/hal/joint/leg/command \
             /aima/hal/joint/waist/command \
@@ -1874,12 +2436,12 @@ elif [[ "$MODE" == "sim" ]]; then
     # deploy doesn't time out in INIT before the first state arrives.
     sleep 2
     if ! kill -0 "$SIM_BRIDGE_PID" 2>/dev/null; then
-        echo -e "${RED}[sim] MuJoCo bridge exited immediately; aborting${NC}" >&2
+        echo -e "$(ts) ${RED}[sim]${NC} MuJoCo bridge exited immediately; aborting" >&2
         echo -e "${RED}      Re-run with --sim-print-scene for diagnostics.${NC}" >&2
         exit 1
     fi
 
-    echo -e "${BLUE}[sim]${NC} starting deploy (cleanup trap installed; Ctrl-C to stop)"
+    echo -e "$(ts) ${BLUE}[sim]${NC} starting deploy (cleanup trap installed; Ctrl-C to stop)"
     ros2 run "$PKG_NAME" x2_deploy_onnx_ref "${ROS2_ARGS[@]}"
 else
     if [[ -f install/setup.bash ]]; then
@@ -1888,5 +2450,489 @@ else
     # NOT `exec` -- we need the EXIT trap (restart_mc_on_exit) to fire after
     # the deploy returns / Ctrl-C. The trap re-exit()s with the deploy's
     # status so callers / CI still see the right code.
-    ros2 run "$PKG_NAME" x2_deploy_onnx_ref "${ROS2_ARGS[@]}"
+
+    # ────────────────────────────────────────────────────────────────────
+    # Cold-warm boot orchestration:
+    #   1. Spawn deploy in background. It boots into STANDBY (writer
+    #      suppressed; no joint commands published), so it does NOT
+    #      contend with MC for the bus while the operator considers
+    #      the safety prompt.
+    #   2. Wait for the ready-sentinel that deploy touches once
+    #      subscribers + ONNX + takeover detectors are armed.
+    #   3. Show the merged safety gate prompt.
+    #   4. On 'Y': stop_app POST + verify MC is silent + touch the
+    #      start-trigger-sentinel. Deploy advances STANDBY -> INIT
+    #      (state already fresh from MC's continuous broadcasts) ->
+    #      WAIT_FOR_CONTROL -> CONTROL within ~20 ms.
+    #   5. Fall through to the existing HOLD_FOR_MC handoff loop (poll
+    #      for hold-for-mc sentinel, POST start_app, escalate to STAND,
+    #      reap deploy).
+    # ────────────────────────────────────────────────────────────────────
+    DEPLOY_PID=""
+    cleanup_bg_deploy_on_cancel() {
+        # Used for the cancel paths (operator says 'n' or Ctrl-C's
+        # before stop_app). At that point MC is still running and the
+        # bg deploy is in STANDBY (silent) -- safe to SIGTERM it. Does
+        # NOT touch MC.
+        if [[ -n "$DEPLOY_PID" ]] && kill -0 "$DEPLOY_PID" 2>/dev/null; then
+            echo -e "$(ts) ${YELLOW}[handoff]${NC} cancelling: SIGTERM-ing background deploy (pid $DEPLOY_PID)."
+            kill -TERM "$DEPLOY_PID" 2>/dev/null || true
+            wait "$DEPLOY_PID" 2>/dev/null || true
+        fi
+        if [[ -n "${DEPLOY_TAIL_PID:-}" ]] && kill -0 "$DEPLOY_TAIL_PID" 2>/dev/null; then
+            kill -TERM "$DEPLOY_TAIL_PID" 2>/dev/null || true
+            wait "$DEPLOY_TAIL_PID" 2>/dev/null || true
+        fi
+    }
+
+    if [[ -n "$START_TRIGGER_SENTINEL" && -n "$READY_SENTINEL" ]]; then
+        echo -e "$(ts) ${BLUE}[handoff]${NC} STANDBY trigger sentinel:    $START_TRIGGER_SENTINEL"
+        echo -e "$(ts) ${BLUE}[handoff]${NC} STANDBY ready sentinel:      $READY_SENTINEL"
+        if [[ -n "$HOLD_FOR_MC_SENTINEL" ]]; then
+            echo -e "$(ts) ${BLUE}[handoff]${NC} HOLD_FOR_MC sentinel:        $HOLD_FOR_MC_SENTINEL"
+            echo -e "$(ts) ${BLUE}[handoff]${NC} HOLD_FOR_MC exit-sentinel:   $HOLD_FOR_MC_EXIT_SENTINEL"
+            echo -e "$(ts) ${BLUE}[handoff]${NC} MC first-publish sentinel:   $MC_FIRST_PUBLISH_SENTINEL"
+        fi
+        # Tee deploy's stdout+stderr to a per-run log file AND back to
+        # this terminal so its [INFO]/[WARN] lines don't corrupt the
+        # safety-gate `read -p` prompt (the previous run had AimdkIo
+        # joint-validation lines bleed into the prompt at 20:32:28).
+        # The tee is line-buffered to keep ordering with bash echos.
+        if [[ -n "${RUN_LOG_DIR:-}" && -d "$RUN_LOG_DIR" ]]; then
+            DEPLOY_STDOUT_LOG="$RUN_LOG_DIR/deploy_stdout.log"
+        else
+            DEPLOY_STDOUT_LOG="/tmp/x2_deploy_stdout.$$.log"
+        fi
+        echo -e "$(ts) ${BLUE}[handoff]${NC} spawning deploy in STANDBY (writer suppressed; stdout -> $DEPLOY_STDOUT_LOG) ..."
+        # 2>&1 first, then route via a coproc-style redirect so we
+        # don't echo deploy's INFO chatter onto the controlling tty
+        # while the operator is being prompted. After the trigger fires
+        # we'll switch to a tail -f style follow so the operator sees
+        # the CONTROL ticks live.
+        ros2 run "$PKG_NAME" x2_deploy_onnx_ref "${ROS2_ARGS[@]}" \
+            >"$DEPLOY_STDOUT_LOG" 2>&1 &
+        DEPLOY_PID=$!
+
+        # Trap to clean up the bg deploy if the user denies / Ctrl-Cs the
+        # safety gate. Replaced with restart_mc_on_exit once stop_app fires.
+        trap 'cleanup_bg_deploy_on_cancel; exit 130' INT TERM
+
+        # Block until ready-sentinel appears (deploy's first STANDBY tick
+        # touches it) OR deploy died early. 30 s upper bound is plenty:
+        # ONNX load + DDS discovery + subscriber settle is ~0.5 s in
+        # practice; the slack covers slow disks / cold caches.
+        echo -e "$(ts) ${BLUE}[handoff]${NC} waiting for deploy ready-sentinel ..."
+        READY_DEADLINE=$(( SECONDS + 30 ))
+        while [[ ! -f "$READY_SENTINEL" ]]; do
+            if ! kill -0 "$DEPLOY_PID" 2>/dev/null; then
+                echo -e "$(ts) ${RED}[handoff]${NC} deploy exited before reaching STANDBY-ready (pid $DEPLOY_PID)."
+                wait "$DEPLOY_PID" 2>/dev/null || true
+                exit 1
+            fi
+            if (( SECONDS >= READY_DEADLINE )); then
+                echo -e "$(ts) ${RED}[handoff]${NC} timeout (30 s) waiting for ready-sentinel; aborting."
+                cleanup_bg_deploy_on_cancel
+                exit 1
+            fi
+            sleep 0.05
+        done
+        echo -e "$(ts) ${GREEN}[handoff]${NC} deploy is in STANDBY and ready."
+
+        # ────────────────────────────────────────────────────────────────
+        # SAFETY GATE -- merged stop_app + launch confirmation. The
+        # robot is still under MC; the bg deploy is silent. Operator
+        # has one decision to make.
+        # ────────────────────────────────────────────────────────────────
+        echo ""
+        echo -e "${RED}═══════════════════════════════════════════════════════════════════════${NC}"
+        echo -e "${RED}  SAFETY GATE -- STOP MC + LAUNCH POLICY${NC}"
+        echo -e "${RED}═══════════════════════════════════════════════════════════════════════${NC}"
+        echo ""
+        echo -e "${YELLOW}  Deploy is loaded and waiting in STANDBY (writer suppressed).${NC}"
+        echo -e "${YELLOW}  Confirming will: POST stop_app to ${MC_EM_URL} -> verify MC${NC}"
+        echo -e "${YELLOW}  silent on bus -> touch trigger sentinel -> deploy enters${NC}"
+        echo -e "${YELLOW}  CONTROL within ~20 ms. The robot stays under active control${NC}"
+        echo -e "${YELLOW}  the whole time (never enters DAMPING / zero-torque).${NC}"
+        echo ""
+        if $DRY_RUN; then
+            echo -e "${YELLOW}  Dry-run: pipeline runs but stiffness/damping are zero --${NC}"
+            echo -e "${YELLOW}  no torque commanded. CSVs will log what WOULD have been sent.${NC}"
+        else
+            echo -e "${RED}  Powered: PD targets WILL be published to /aima/hal/joint/*/command${NC}"
+            echo -e "${RED}  at ~500 Hz. Soft-start ramp blends policy in over --ramp-seconds.${NC}"
+        fi
+        echo ""
+        echo -e "${YELLOW}  Confirm BEFORE proceeding:${NC}"
+        echo -e "${YELLOW}    [ ] Robot is firmly supported (gantry / harness / hand-held)${NC}"
+        echo -e "${YELLOW}    [ ] No personnel within arm or leg reach of robot${NC}"
+        echo -e "${YELLOW}    [ ] You are ready for slight settling motion when MC releases${NC}"
+        if ! $DRY_RUN; then
+            echo -e "${RED}    [ ] E-stop is within reach (this is NOT a dry-run)${NC}"
+        fi
+        echo ""
+        if [[ -n "$HOLD_FOR_MC_TIMEOUT_S" && "$HOLD_FOR_MC_TIMEOUT_S" != "0" ]]; then
+            echo -e "${BLUE}  Smooth handoff: deploy will RAMP_OUT to MC's STAND_DEFAULT pose,${NC}"
+            echo -e "${BLUE}  then HOLD that pose (MC-stand gains) while bash POSTs start_app${NC}"
+            echo -e "${BLUE}  + SetMcAction(JOINT_DEFAULT -> STAND_DEFAULT). Deploy exits cleanly${NC}"
+            echo -e "${BLUE}  once MC has the bus back. Run starts AND ends in STAND_DEFAULT.${NC}"
+        fi
+        echo ""
+        if ! $NO_CONFIRM; then
+            read -p "$(echo -e ${RED}Stop MC and launch policy? [y/N]: ${NC})" mc_confirm
+            if [[ ! "$mc_confirm" =~ ^[Yy]$ ]]; then
+                echo -e "$(ts) ${YELLOW}[handoff]${NC} cancelled before MC stop. Robot is unchanged."
+                cleanup_bg_deploy_on_cancel
+                exit 0
+            fi
+        else
+            echo -e "$(ts) ${YELLOW}[handoff]${NC} --no-confirm: skipping safety gate."
+        fi
+
+        # Operator confirmed. From here we're committed -- swap traps so
+        # an error/Ctrl-C will restart MC (cleanup_bg_deploy_on_cancel
+        # is no longer the right thing because the deploy is what's
+        # holding the robot).
+        echo ""
+        echo -e "$(ts) ${BLUE}[handoff]${NC} stopping MC via PC1 EM HTTP API ($MC_EM_URL) ..."
+        if ! mc_em_post stop_app; then
+            echo -e "$(ts) ${RED}[handoff]${NC} POST $MC_EM_URL/json/stop_app failed."
+            echo -e "${YELLOW}  Possible causes:${NC}"
+            echo -e "${YELLOW}    - host has no route to 10.0.1.40 (check enp10s0 IP / SDK cable)${NC}"
+            echo -e "${YELLOW}    - PC1 EM is not running${NC}"
+            echo -e "${YELLOW}    - MC is already stopped from a previous run (use --no-stop-mc)${NC}"
+            cleanup_bg_deploy_on_cancel
+            exit 1
+        fi
+        MC_STOPPED_BY_US=true
+        # Replace the cancel trap with the cleanup trap. From now on
+        # any unexpected exit must restart MC.
+        trap restart_mc_on_exit EXIT INT TERM
+
+        # Fire the start-trigger sentinel IMMEDIATELY after stop_app's
+        # synchronous return. The HTTP POST to PC1's EM is itself the
+        # confirmation that MC's process has stopped -- if it hadn't,
+        # mc_em_post would have returned non-zero and we'd have bailed
+        # already. Skipping the publisher-count verify shaves ~3 s off
+        # the Y -> CONTROL latency. Note: in the STANDBY architecture
+        # `ros2 topic info` would always report >= 1 publisher because
+        # the deploy node's own AimdkIo publisher is alive throughout
+        # STANDBY (just gated from publishing); the legacy "expected 0"
+        # check was guaranteed to fail and waste ~3 s polling for an
+        # impossible state.
+        : > "$START_TRIGGER_SENTINEL"
+        echo -e "$(ts) ${GREEN}[handoff]${NC} start-trigger sentinel touched -> deploy entering CONTROL."
+
+        # Now stream the deploy's pre-trigger output (everything from
+        # boot through STANDBY) and tail-follow it for the rest of the
+        # run. Tail is killed when the bg deploy exits.
+        if [[ -f "$DEPLOY_STDOUT_LOG" ]]; then
+            cat "$DEPLOY_STDOUT_LOG"
+            tail -n 0 -F "$DEPLOY_STDOUT_LOG" 2>/dev/null &
+            DEPLOY_TAIL_PID=$!
+        fi
+
+        # Best-effort sanity check, asynchronous to the trigger fire so
+        # it doesn't add to the latency. Counts publishers on
+        # /aima/hal/joint/arm/command: we expect 1 (the deploy node
+        # itself). >= 2 means MC didn't actually stop and we're about
+        # to dual-publish; surface that loudly (still proceed -- bailing
+        # now would leave the robot half-committed).
+        if command -v ros2 &>/dev/null; then
+            (
+                ARM_CMD_PUBS=$(timeout 1 ros2 topic info /aima/hal/joint/arm/command 2>/dev/null \
+                    | awk '/Publisher count:/ {print $NF}')
+                if [[ "${ARM_CMD_PUBS:-?}" == "1" ]]; then
+                    echo -e "$(ts) ${GREEN}[handoff]${NC} bus check OK: 1 publisher (deploy) on /aima/hal/joint/arm/command."
+                elif [[ "${ARM_CMD_PUBS:-?}" == "0" ]]; then
+                    echo -e "$(ts) ${YELLOW}[handoff]${NC} bus check: 0 publishers (deploy may not have advanced past STANDBY yet)."
+                else
+                    echo -e "$(ts) ${RED}[handoff]${NC} bus check WARNING: ${ARM_CMD_PUBS:-?} publishers (expected 1). MC may not have actually stopped -- watch for motor whir."
+                fi
+            ) &
+        fi
+        echo ""
+    elif [[ -n "$HOLD_FOR_MC_SENTINEL" ]]; then
+        # Pre-cold-warm-boot fallback (shouldn't happen on real-robot
+        # mode now that we always set the trigger/ready sentinels, but
+        # kept defensively): launch in foreground-as-background, no
+        # STANDBY pre-launch.
+        echo -e "$(ts) ${YELLOW}[handoff]${NC} STANDBY sentinels not configured; using legacy stop_app -> launch flow."
+        # Operator confirmation BEFORE stop_app for the legacy path.
+        if ! $NO_CONFIRM; then
+            read -p "$(echo -e ${RED}Stop MC and launch policy? [y/N]: ${NC})" mc_confirm
+            if [[ ! "$mc_confirm" =~ ^[Yy]$ ]]; then
+                echo -e "${YELLOW}Cancelled before MC stop. Robot is unchanged.${NC}"
+                exit 0
+            fi
+        fi
+        if ! $NO_STOP_MC; then
+            mc_em_post stop_app || { echo -e "${RED}stop_app failed${NC}"; exit 1; }
+            MC_STOPPED_BY_US=true
+            trap restart_mc_on_exit EXIT INT TERM
+            sleep 1
+        fi
+        echo -e "$(ts) ${BLUE}[handoff]${NC} HOLD_FOR_MC sentinel:        $HOLD_FOR_MC_SENTINEL"
+        echo -e "$(ts) ${BLUE}[handoff]${NC} HOLD_FOR_MC exit-sentinel:   $HOLD_FOR_MC_EXIT_SENTINEL"
+        echo -e "$(ts) ${BLUE}[handoff]${NC} MC first-publish sentinel:   $MC_FIRST_PUBLISH_SENTINEL"
+        ros2 run "$PKG_NAME" x2_deploy_onnx_ref "${ROS2_ARGS[@]}" &
+        DEPLOY_PID=$!
+    else
+        # Legacy path: HOLD_FOR_MC disabled. Run the deploy in the
+        # foreground; the cleanup trap brings MC back after deploy
+        # exits. There is a zero-torque window between deploy-exit
+        # and MC-up here.
+        if ! $NO_CONFIRM; then
+            read -p "$(echo -e ${RED}Stop MC and launch policy? [y/N]: ${NC})" mc_confirm
+            if [[ ! "$mc_confirm" =~ ^[Yy]$ ]]; then
+                echo -e "${YELLOW}Cancelled before MC stop. Robot is unchanged.${NC}"
+                exit 0
+            fi
+        fi
+        if ! $NO_STOP_MC; then
+            mc_em_post stop_app || { echo -e "${RED}stop_app failed${NC}"; exit 1; }
+            MC_STOPPED_BY_US=true
+            trap restart_mc_on_exit EXIT INT TERM
+            sleep 1
+        fi
+        ros2 run "$PKG_NAME" x2_deploy_onnx_ref "${ROS2_ARGS[@]}"
+        DEPLOY_RC=$?
+        exit "$DEPLOY_RC"
+    fi
+
+    # ────────────────────────────────────────────────────────────────────
+    # HOLD_FOR_MC handoff loop (deploy is now running; we've already
+    # POSTed stop_app + touched the start-trigger sentinel above for
+    # the cold-warm path, or skipped that for legacy).
+    # Poll for HOLD_FOR_MC_SENTINEL the deploy node touches on entering
+    # HOLD_FOR_MC. The moment we see it, POST start_app + drive MC back
+    # to STAND_DEFAULT WHILE the deploy is still actively holding the
+    # bus (no zero-torque window). Deploy's MC-takeover detector then
+    # exits cleanly within <= 20 ms; we wait on its PID for the final
+    # exit code. If the sentinel never appears (deploy crashed in
+    # CONTROL, or HOLD_FOR_MC was disabled), the cleanup trap's
+    # restart_mc_on_exit still fires start_app as the fallback path.
+    # ────────────────────────────────────────────────────────────────────
+    if [[ -n "$DEPLOY_PID" && -n "$HOLD_FOR_MC_SENTINEL" ]]; then
+        HANDOFF_DONE=false
+        while kill -0 "$DEPLOY_PID" 2>/dev/null; do
+            if ! $HANDOFF_DONE && [[ -f "$HOLD_FOR_MC_SENTINEL" ]]; then
+                HANDOFF_DONE=true
+                echo ""
+                echo -e "$(ts) ${GREEN}[handoff]${NC} HOLD_FOR_MC sentinel detected -- deploy is in HOLD_FOR_MC."
+                echo -e "$(ts) ${BLUE}[handoff]${NC} POSTing start_app to bring MC back ..."
+                if mc_em_post start_app; then
+                    echo -e "$(ts) ${GREEN}[handoff]${NC} MC start_app POSTed."
+                    # MC is now running; clear MC_STOPPED_BY_US so the
+                    # cleanup trap can't double-POST start_app later
+                    # (HTTP 500 if MC is already up).
+                    MC_STOPPED_BY_US=false
+                    # ────────────────────────────────────────────────
+                    # Inline escalation: PASSIVE_DEFAULT -> JOINT_DEFAULT
+                    # -> exit deploy -> STAND_DEFAULT.
+                    #
+                    # Why split it this way (changed 2026-05-03 after
+                    # operator observed ~3s of motor whirring during
+                    # the JOINT->STAND window): the previous flow
+                    # waited until STAND_DEFAULT before touching the
+                    # exit-sentinel, so deploy + MC both published
+                    # for the full ~1.3s of the JOINT->STAND escalation.
+                    # That's the dual-publisher fight (deploy kp=24
+                    # vs MC's JOINT kp=30 vs MC's STAND kp=30, all at
+                    # 500 Hz on the same topic) the user heard as
+                    # whirring.
+                    #
+                    # JOINT_DEFAULT is already an actively-balancing
+                    # mode (kp_arm=30, eff_leg ~6 Nm, robot firmly
+                    # held). Once MC is in JOINT_DEFAULT we can release
+                    # deploy immediately -- MC alone handles the
+                    # JOINT->STAND transition with no zero-torque
+                    # window. Net result: ~20ms of dual-publisher
+                    # overlap (sentinel-touch -> deploy's next
+                    # OnControl tick) instead of ~1.3s.
+                    # ────────────────────────────────────────────────
+                    HANDOFF_OK=false
+                    if command -v ros2 &>/dev/null; then
+                        # ────────────────────────────────────────────────
+                        # Spawn the persistent-client escalator BEFORE we
+                        # start polling/waiting. It hammers SetMcAction(
+                        # JOINT_DEFAULT) at 20 Hz with a held-open service
+                        # client, so the very first attempt that lands
+                        # AFTER MC's services come up succeeds within one
+                        # tick (sub-ms RTT, no per-call rclpy startup).
+                        #
+                        # Pre-launch failed calls are harmless -- MC just
+                        # returns code != 0 ("service not ready / mode
+                        # rejected") and we retry.
+                        #
+                        # Compared to the old "wait for MC, then issue one
+                        # `ros2 service call`" flow, this saves ~700 ms of
+                        # cumulative bash + rclpy startup overhead, which
+                        # directly cuts the dual-publisher whir window
+                        # MC's PASSIVE_DEFAULT phase by the same amount.
+                        # ────────────────────────────────────────────────
+                        if [[ -n "${RUN_LOG_DIR:-}" && -d "$RUN_LOG_DIR" ]]; then
+                            ESCALATOR_OK_SENTINEL="$RUN_LOG_DIR/mc_escalator_ok.sentinel"
+                            ESCALATOR_LOG="$RUN_LOG_DIR/mc_escalator.log"
+                        else
+                            ESCALATOR_OK_SENTINEL="/tmp/x2_mc_escalator_ok.$$.sentinel"
+                            ESCALATOR_LOG="/tmp/x2_mc_escalator.$$.log"
+                        fi
+                        rm -f "$ESCALATOR_OK_SENTINEL"
+                        ESCALATOR_SCRIPT="$SCRIPT_DIR/scripts/x2_mc_escalator.py"
+                        if [[ ! -x "$ESCALATOR_SCRIPT" && -f "$ESCALATOR_SCRIPT" ]]; then
+                            chmod +x "$ESCALATOR_SCRIPT" 2>/dev/null || true
+                        fi
+                        ESCALATOR_PID=""
+                        if [[ -f "$ESCALATOR_SCRIPT" ]]; then
+                            python3 "$ESCALATOR_SCRIPT" \
+                                --target JOINT_DEFAULT \
+                                --rate-hz 20 \
+                                --timeout-s 30 \
+                                --call-timeout-s 0.4 \
+                                --success-sentinel "$ESCALATOR_OK_SENTINEL" \
+                                --log "$ESCALATOR_LOG" \
+                                >>"$ESCALATOR_LOG" 2>&1 &
+                            ESCALATOR_PID=$!
+                            echo -e "$(ts) ${BLUE}[post-handoff]${NC} escalator launched (pid $ESCALATOR_PID): hammering SetMcAction(JOINT_DEFAULT) at 20Hz, ok-sentinel=$ESCALATOR_OK_SENTINEL"
+                        else
+                            echo -e "$(ts) ${YELLOW}[post-handoff]${NC} escalator script not found ($ESCALATOR_SCRIPT); falling back to single-shot mc_set_action."
+                        fi
+
+                        # Wait up to 30 s for either (a) the escalator to
+                        # report success, or (b) deploy's first-publish
+                        # sentinel to fire (= MC services are alive even
+                        # if the escalator is still waiting on a clean
+                        # accept). We poll at 50 ms granularity.
+                        MC_BOOT_MODE=""
+                        ESCALATOR_OK=false
+                        for _i in $(seq 1 600); do
+                            if [[ -f "$ESCALATOR_OK_SENTINEL" ]]; then
+                                ESCALATOR_OK=true
+                                MC_BOOT_MODE="JOINT_DEFAULT"
+                                break
+                            fi
+                            if [[ -f "$MC_FIRST_PUBLISH_SENTINEL" && -z "$MC_BOOT_MODE" ]]; then
+                                MC_BOOT_MODE="PASSIVE_DEFAULT"
+                                # Don't break -- keep waiting for the
+                                # escalator to confirm JOINT_DEFAULT.
+                            fi
+                            sleep 0.05
+                        done
+
+                        # If escalator timed out but first-publish fired,
+                        # try one more bash-side mc_set_action as a
+                        # fallback; this preserves the previous
+                        # single-shot path's behaviour.
+                        if ! $ESCALATOR_OK && [[ -n "$MC_BOOT_MODE" ]]; then
+                            echo -e "$(ts) ${YELLOW}[post-handoff]${NC} escalator did not confirm (mode=$MC_BOOT_MODE); falling back to single-shot SetMcAction(JOINT_DEFAULT)."
+                            if mc_set_action JOINT_DEFAULT; then
+                                MC_BOOT_MODE="JOINT_DEFAULT"
+                                ESCALATOR_OK=true
+                            else
+                                echo -e "$(ts) ${RED}[post-handoff]${NC} fallback SetMcAction(JOINT_DEFAULT) rejected."
+                            fi
+                        fi
+
+                        if [[ -z "$MC_BOOT_MODE" ]]; then
+                            echo -e "$(ts) ${RED}[post-handoff]${NC} MC services never came up after start_app (escalator timed out and first-publish never fired)."
+                        else
+                            if $ESCALATOR_OK; then
+                                echo -e "$(ts) ${GREEN}[post-handoff]${NC} -> JOINT_DEFAULT confirmed by escalator (active PD; releasing deploy now)."
+                            elif [[ -f "$MC_FIRST_PUBLISH_SENTINEL" ]]; then
+                                echo -e "$(ts) ${BLUE}[post-handoff]${NC} MC came back up (first-publish detected on bus, mode=$MC_BOOT_MODE)."
+                            else
+                                echo -e "$(ts) ${BLUE}[post-handoff]${NC} MC came back up in $MC_BOOT_MODE."
+                            fi
+                            # CRITICAL: release deploy AS SOON AS MC is in
+                            # JOINT_DEFAULT (or already STAND_DEFAULT). This
+                            # is the single most important moment for the
+                            # smooth handoff; everything below is async.
+                            if [[ "$MC_BOOT_MODE" == "JOINT_DEFAULT" || "$MC_BOOT_MODE" == "STAND_DEFAULT" ]]; then
+                                : > "$HOLD_FOR_MC_EXIT_SENTINEL"
+                                echo -e "$(ts) ${BLUE}[handoff]${NC} exit-sentinel touched (MC is in $MC_BOOT_MODE); deploy will release the bus on its next tick."
+                                HANDOFF_OK=true
+                            fi
+                            # JOINT_DEFAULT -> STAND_DEFAULT. Deploy is
+                            # already exiting (or exited) at this point;
+                            # MC handles the rest of the escalation alone.
+                            #
+                            # Verify the transition via mc_get_action.
+                            # Like SetMcAction(JOINT_DEFAULT), the
+                            # SetMcAction(STAND_DEFAULT) response code is
+                            # not a reliable confirmation -- it returns
+                            # code=0 even when MC is still booting and
+                            # silently ignores the request. Confirmed via
+                            # the 2026-05-03 run x2_run_20260503_213002,
+                            # where bash logged "STAND_DEFAULT confirmed"
+                            # but the recorder showed MC stayed in
+                            # PASSIVE_DEFAULT throughout. Treat
+                            # mc_get_action as ground truth.
+                            if [[ "$MC_BOOT_MODE" == "JOINT_DEFAULT" ]]; then
+                                if mc_set_action STAND_DEFAULT; then
+                                    POST_STAND_OK=false
+                                    POST_STAND_MODE=""
+                                    for _i in $(seq 1 40); do
+                                        POST_STAND_MODE="$(mc_get_action 0.3 2>/dev/null || true)"
+                                        if [[ "$POST_STAND_MODE" == "STAND_DEFAULT" ]]; then
+                                            POST_STAND_OK=true
+                                            break
+                                        fi
+                                        sleep 0.05
+                                    done
+                                    if $POST_STAND_OK; then
+                                        echo -e "$(ts) ${GREEN}[post-handoff]${NC} -> STAND_DEFAULT confirmed via mc_get_action."
+                                    else
+                                        echo -e "$(ts) ${RED}[post-handoff]${NC} SetMcAction(STAND_DEFAULT) returned code=0 but mc_get_action reports ${POST_STAND_MODE:-<empty>}, NOT STAND_DEFAULT. Robot may be in wrong mode -- check the mobile app."
+                                    fi
+                                else
+                                    echo -e "$(ts) ${RED}[post-handoff]${NC} SetMcAction(STAND_DEFAULT) was rejected."
+                                fi
+                            fi
+                        fi
+
+                        # Reap escalator if still alive (it should have
+                        # exited on success-sentinel).
+                        if [[ -n "$ESCALATOR_PID" ]] && kill -0 "$ESCALATOR_PID" 2>/dev/null; then
+                            kill -TERM "$ESCALATOR_PID" 2>/dev/null || true
+                            wait "$ESCALATOR_PID" 2>/dev/null || true
+                        fi
+                    fi
+                    if ! $HANDOFF_OK; then
+                        echo -e "$(ts) ${RED}[handoff]${NC} MC escalation did not reach JOINT_DEFAULT."
+                        echo -e "${YELLOW}  Deploy will keep holding the robot until${NC}"
+                        echo -e "${YELLOW}  --hold-for-mc-timeout-s elapses. To recover:${NC}"
+                        echo -e "${YELLOW}    1. From the mobile app, switch MC to Standing Default.${NC}"
+                        echo -e "${YELLOW}    2. touch $HOLD_FOR_MC_EXIT_SENTINEL${NC}"
+                        echo -e "${YELLOW}  to release the deploy.${NC}"
+                    fi
+                else
+                    echo -e "$(ts) ${RED}[handoff]${NC} MC start_app POST failed."
+                    echo -e "${YELLOW}  Deploy will hold STAND_DEFAULT pose until${NC}"
+                    echo -e "${YELLOW}  --hold-for-mc-timeout-s elapses. Check the MC HTTP API.${NC}"
+                fi
+            fi
+            sleep 0.1
+        done
+        wait "$DEPLOY_PID"
+        DEPLOY_RC=$?
+        if [[ -n "${DEPLOY_TAIL_PID:-}" ]] && kill -0 "$DEPLOY_TAIL_PID" 2>/dev/null; then
+            kill -TERM "$DEPLOY_TAIL_PID" 2>/dev/null || true
+            wait "$DEPLOY_TAIL_PID" 2>/dev/null || true
+        fi
+        rm -f "$HOLD_FOR_MC_SENTINEL" "$HOLD_FOR_MC_EXIT_SENTINEL" \
+              "$MC_FIRST_PUBLISH_SENTINEL" \
+              "$START_TRIGGER_SENTINEL" "$READY_SENTINEL"
+        echo -e "$(ts) ${BLUE}[handoff]${NC} deploy exited with code $DEPLOY_RC."
+        exit "$DEPLOY_RC"
+    elif [[ -n "$DEPLOY_PID" ]]; then
+        # No HOLD_FOR_MC; just wait on the bg deploy.
+        wait "$DEPLOY_PID"
+        DEPLOY_RC=$?
+        if [[ -n "${DEPLOY_TAIL_PID:-}" ]] && kill -0 "$DEPLOY_TAIL_PID" 2>/dev/null; then
+            kill -TERM "$DEPLOY_TAIL_PID" 2>/dev/null || true
+            wait "$DEPLOY_TAIL_PID" 2>/dev/null || true
+        fi
+        rm -f "$START_TRIGGER_SENTINEL" "$READY_SENTINEL"
+        exit "$DEPLOY_RC"
+    fi
 fi
