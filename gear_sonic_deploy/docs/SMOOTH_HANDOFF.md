@@ -172,6 +172,20 @@ not complete -- bash logs are not authoritative. Cross-reference
 `cmd_kp_*` and `state_eff_*` traces to confirm whether deploy or MC was
 publishing during each segment.
 
+## Validated handoff numbers (run-to-run)
+
+| Date | Motion | Notes | `JOINT_DEFAULT` dwell | Final mode |
+|---|---|---|---:|---|
+| 2026-05-03 (gestures) | `standing_gestures_v1`, iter-16k | Pre-escalator (one-shot bash `mc_set_action`) | 1.60 s | STAND_DEFAULT |
+| 2026-05-03 (walk) | `casual_walk_v1`, iter-22k | Persistent-client escalator + GetMcAction ground-truth | **0.20 s** | STAND_DEFAULT |
+
+The 8× drop in dwell time is the dual-publisher whir window
+proportionally shrinking. With deploy still publishing during the
+`JOINT_DEFAULT` window (until exit-sentinel fires), shorter dwell ==
+shorter time both sides drive the bus. 0.20 s is operator-imperceptible
+in the audio signature; 1.60 s was the "couple of seconds of whirring"
+the operator reported on 2026-05-03 morning.
+
 ## Phase 2 direction: input-source arbitration
 
 We have a *better* path that we deliberately deferred. MC exposes an

@@ -1,7 +1,7 @@
 # X2 Ultra Sim-to-Real WIP — Status & Hand-off Notes
 
 **Branch:** `deploy_sim_to_real`
-**Last update:** 2026-04-27
+**Last update:** 2026-05-03
 **Owner:** sitaram
 
 This document is the running notebook for the AgiBot X2 Ultra
@@ -46,6 +46,17 @@ and CLI reference see
   (`joint_pos_mj` / `joint_vel_mj` / `tokenizer_obs` / `base_ang_vel`
   all max\|Δ\| = 0.0) and the robot stands cleanly through the 30 s
   gate. See {doc}`sim2sim_mujoco` G22 / G23 for the full write-up.
+- **2026-05-03 update.** **First powered walk on the real X2 Ultra.**
+  iter-22000 sphere-foot checkpoint tracked the `casual_walk_v1`
+  reference (one out-and-back cycle of `Turn_Start_Walk_0090_003`,
+  ~13.5 s of locomotion + idle anchors) on a one-way rail gantry. Hip
+  yaw tracked at 97 % cmd→state on both legs (±55° foot rotation),
+  waist yaw at 98 %, max tilt 18.8° at the turn apex, no fall, no
+  RAMP_OUT trip, clean MC handoff with **0.20 s `JOINT_DEFAULT` dwell**
+  (down from 1.60 s on the previous gestures run thanks to the
+  persistent-client escalator with `GetMcAction` ground-truth). Full
+  write-up in
+  {doc}`milestones/2026-05-03_first_iter22000_powered_walk`.
 
 ---
 
@@ -89,6 +100,9 @@ and CLI reference see
 | 2026-04-22 | `idle_stand` | 1 s, 2 s, 5 s | All clean. `--max-target-dev 0.03` saturates but no danger. |
 | 2026-04-22 | `take_a_sip` | 5 s, `--max-target-dev 0.30` | Clean run. Original red-light incident at MC handoff — root cause: no return-to-default ramp. |
 | 2026-04-27 | `take_a_sip` | 5 s × 4 runs, `--max-target-dev 0.30`, `--return-seconds 2.0` | All clean, no red light, MC happily resumed walking. |
+| 2026-05-02 | `minimal_v1` | 5 s, iter-4000 sphere-foot, `--max-target-dev 0.30` | First powered run after closing the C++ sim-to-sim gap. Rock-solid stand, 0 action-clip events. See {doc}`milestones/2026-05-02_first_iter4000_powered_run`. |
+| 2026-05-02 | `standing_gestures_v1` | 22 s, iter-{4k,10k,16k}, `expressive` preset (`--max-target-dev 1.80 --target-lpf-hz 5.0`) | Visibly fuller arm motion than `conservative`. Recorder + tuning toolchain landed alongside. See {doc}`milestones/2026-05-02_post_deploy_tuning`. |
+| 2026-05-03 | `casual_walk_v1` | 14 s, iter-22000 sphere-foot, `expressive` + `--max-target-dev 1.50 --target-lpf-hz 5.0` | **First powered walk.** Out-and-back cycle with 180° turn at the apex on a one-way rail gantry. Hip-yaw tracking 97 %, waist-yaw 98 %, max tilt 18.8°, no fall. MC handoff `JOINT_DEFAULT` dwell 0.20 s (8× shorter than gestures run). See {doc}`milestones/2026-05-03_first_iter22000_powered_walk`. |
 
 ---
 
