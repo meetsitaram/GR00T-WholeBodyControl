@@ -45,6 +45,14 @@ lose temporal fidelity):
   imu_angvel           [N, 3]
   imu_linacc           [N, 3]
 
+  # MC mode timeline (only when --track-mc-mode and GetMcAction is reachable):
+  t_mc_mode            [M]                 # float64, monotonic seconds
+  mc_mode_str          [M]                 # object array of mode-name strings,
+                                           # e.g. "STAND_DEFAULT" / "JOINT_DEFAULT"
+                                           # / "PASSIVE_DEFAULT" / "DAMPING_DEFAULT"
+                                           # / "LOCOMOTION_DEFAULT" or "" if poll
+                                           # failed during that sample.
+
 Two run modes:
 
 * default: record live until ``--duration`` or Ctrl-C, then dump+summarize.
@@ -182,6 +190,18 @@ class ImuStreamBuf:
     linacc: list[list[float]] = field(default_factory=list)
 
 
+@dataclass
+class McModeBuf:
+    """Timestamped MC mode samples from periodic GetMcAction polling.
+    ``mode`` carries strings like ``"STAND_DEFAULT"`` / ``"JOINT_DEFAULT"``
+    or empty string when a poll failed (cross-host service flakiness)."""
+
+    t: list[float] = field(default_factory=list)
+    mode: list[str] = field(default_factory=list)
+    last_mode: str = ""           # for status-line printing
+    fail_warned: bool = False     # gate single warn on first failure
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Recorder node. The rclpy / aimdk_msgs imports are guarded so this
 # module remains importable on hosts that have only numpy (so
@@ -202,6 +222,15 @@ try:
     from aimdk_msgs.msg import JointCommandArray, JointStateArray
     from sensor_msgs.msg import Imu
     _ROS_IMPORT_ERROR: Optional[BaseException] = None
+    # GetMcAction is optional -- on some firmwares the service may be absent
+    # or namespaced differently. Failure to import just disables MC tracking,
+    # rest of the recorder still works.
+    try:
+        from aimdk_msgs.srv import GetMcAction  # type: ignore
+        _GETMCACTION_IMPORT_ERROR: Optional[BaseException] = None
+    except ImportError as _e_get:
+        GetMcAction = None  # type: ignore
+        _GETMCACTION_IMPORT_ERROR = _e_get
 except ImportError as _e:
     rclpy = None  # type: ignore
     SingleThreadedExecutor = None  # type: ignore
@@ -209,6 +238,8 @@ except ImportError as _e:
     JointCommandArray = None  # type: ignore
     JointStateArray = None  # type: ignore
     Imu = None  # type: ignore
+    GetMcAction = None  # type: ignore
+    _GETMCACTION_IMPORT_ERROR = _e
     _ROS_IMPORT_ERROR = _e
 
     class _DummyQoS:  # placeholders so module-level def below stays valid
@@ -237,8 +268,16 @@ _QOS = (
 
 
 class RecorderNode(_RclpyNode):
+    # Service name MC speaks at runtime. Mirrors the documented surface in
+    # docs/source/user_guide/x2_first_real_robot.md (lines 196-204) and the
+    # X2 SDK example_pkg::set_mc_action.cpp pattern. Note the literal "_5F"
+    # in the path -- that's the ROS-mangled form of the leading underscore
+    # in "aimdk_msgs", not a typo.
+    GET_MC_ACTION_SERVICE = "/aimdk_5Fmsgs/srv/GetMcAction"
+
     def __init__(self, imu_topic: str, status_period_s: float = 1.0,
-                 quiet: bool = False):
+                 quiet: bool = False, track_mc_mode: bool = True,
+                 mc_poll_hz: float = 5.0):
         if _ROS_IMPORT_ERROR is not None:
             raise SystemExit(
                 "ERROR: rclpy / aimdk_msgs not importable. Live recording\n"
@@ -257,6 +296,7 @@ class RecorderNode(_RclpyNode):
             g.name: JointStreamBuf(n_joints=len(g.joint_names)) for g in GROUPS
         }
         self._imu_buf = ImuStreamBuf()
+        self._mc_mode_buf = McModeBuf()
         self._imu_topic = imu_topic
 
         # Per-group MJ-index maps (joint_name -> col in our matrix).
@@ -277,6 +317,28 @@ class RecorderNode(_RclpyNode):
             )
 
         self.create_subscription(Imu, imu_topic, self._on_imu, _QOS)
+
+        # MC-mode polling. Optional: only if the operator wants it AND the
+        # GetMcAction service type imported cleanly. Soft-failure on every
+        # axis (no service type, service not advertised, single-call timeout)
+        # so the rest of the recording is unaffected.
+        self._mc_client = None
+        self._mc_track = bool(track_mc_mode)
+        self._mc_poll_hz = float(mc_poll_hz)
+        if self._mc_track:
+            if _GETMCACTION_IMPORT_ERROR is not None:
+                self.get_logger().warn(
+                    "MC-mode tracking disabled: aimdk_msgs.srv.GetMcAction "
+                    f"unavailable ({_GETMCACTION_IMPORT_ERROR})"
+                )
+                self._mc_track = False
+            else:
+                self._mc_client = self.create_client(
+                    GetMcAction, self.GET_MC_ACTION_SERVICE,
+                )
+        if self._mc_track and self._mc_poll_hz > 0:
+            period = 1.0 / self._mc_poll_hz
+            self.create_timer(period, self._on_mc_poll)
 
         if status_period_s > 0 and not quiet:
             self.create_timer(status_period_s, self._on_status)
@@ -343,6 +405,54 @@ class RecorderNode(_RclpyNode):
             la = msg.linear_acceleration
             self._imu_buf.linacc.append([float(la.x), float(la.y), float(la.z)])
 
+    # ── MC mode polling ──────────────────────────────────────────────────
+
+    def _on_mc_poll(self) -> None:
+        """Fire one async GetMcAction request. The result lands in
+        ``_on_mc_response`` whenever the MC service answers. We never
+        block the executor: if the service is slow / unreachable, the
+        next tick just queues another request. Empty samples (poll
+        failure) are still timestamped so the .npz preserves cadence
+        and segmentation logic can detect 'silent windows'."""
+        if self._mc_client is None:
+            return
+        # service_is_ready is non-blocking; cheap.
+        if not self._mc_client.service_is_ready():
+            with self._lock:
+                self._mc_mode_buf.t.append(self._now())
+                self._mc_mode_buf.mode.append("")
+                if not self._mc_mode_buf.fail_warned and not self._quiet:
+                    self._mc_mode_buf.fail_warned = True
+                    self.get_logger().warn(
+                        f"MC service '{self.GET_MC_ACTION_SERVICE}' not "
+                        f"advertised (yet?). Future poll failures suppressed."
+                    )
+            return
+        req = GetMcAction.Request()
+        future = self._mc_client.call_async(req)
+        future.add_done_callback(self._on_mc_response)
+
+    def _on_mc_response(self, future) -> None:
+        t = self._now()
+        try:
+            resp = future.result()
+        except Exception:
+            resp = None
+        mode = ""
+        if resp is not None:
+            # The X2 SDK's reply nests the action inside `info`; older
+            # firmwares put it at the top level. Try both before giving up.
+            info = getattr(resp, "info", None)
+            if info is not None:
+                mode = str(getattr(info, "action_desc", "") or "")
+            if not mode:
+                mode = str(getattr(resp, "action_desc", "") or "")
+        with self._lock:
+            self._mc_mode_buf.t.append(t)
+            self._mc_mode_buf.mode.append(mode)
+            if mode:
+                self._mc_mode_buf.last_mode = mode
+
     # ── 1 Hz status line ─────────────────────────────────────────────────
 
     def _on_status(self) -> None:
@@ -367,6 +477,10 @@ class RecorderNode(_RclpyNode):
                 diff = diff[np.isfinite(diff)]
                 if diff.size > 0:
                     parts.append(f"arm_track_max={float(np.max(diff)):.3f}rad")
+
+            if self._mc_track:
+                mc_now = self._mc_mode_buf.last_mode or "?"
+                parts.append(f"mc:{mc_now}")
 
             print(" ".join(parts), flush=True)
 
@@ -406,6 +520,11 @@ class RecorderNode(_RclpyNode):
                 if ib.angvel else np.empty((0, 3), dtype=np.float64)
             out["imu_linacc"] = np.asarray(ib.linacc, dtype=np.float64) \
                 if ib.linacc else np.empty((0, 3), dtype=np.float64)
+
+            mb = self._mc_mode_buf
+            out["t_mc_mode"] = np.asarray(mb.t, dtype=np.float64)
+            out["mc_mode_str"] = np.asarray(mb.mode, dtype=object) \
+                if mb.mode else np.empty((0,), dtype=object)
 
             return out
 
@@ -564,6 +683,207 @@ def _print_arm_spotlight(snap: dict) -> None:
           "(MC/HAL fighting back, or kp too low).")
 
 
+def _segment_by_mode(t_mode: np.ndarray, mode_str: np.ndarray,
+                     t_end: float) -> list[tuple[float, float, str]]:
+    """Compress consecutive (t, mode_str) samples into [t_start, t_end, mode]
+    segments. Empty-string ('' -- failed poll) samples extend whichever
+    mode they're sandwiched in: they don't open a new segment but they
+    don't close one either. The recording's wall end-time t_end caps
+    the last segment.
+
+    Returns a list of (t_start, t_end, mode_label) tuples, mode_label
+    = "" if every sample in the window failed (rare; service down)."""
+    if t_mode.size == 0 or mode_str.size == 0:
+        return []
+    segs: list[list] = []
+    cur_label = ""
+    seg_start = float(t_mode[0])
+    for i in range(t_mode.size):
+        m = str(mode_str[i]) if mode_str[i] is not None else ""
+        if not m:
+            continue  # skip failed polls; they extend whatever segment is open
+        if not segs:
+            segs.append([seg_start, float(t_mode[i]), m])
+            cur_label = m
+            continue
+        if m != cur_label:
+            segs[-1][1] = float(t_mode[i])
+            segs.append([float(t_mode[i]), float(t_mode[i]), m])
+            cur_label = m
+        else:
+            segs[-1][1] = float(t_mode[i])
+    if segs:
+        segs[-1][1] = max(segs[-1][1], t_end)
+    return [(s, e, m) for s, e, m in segs]
+
+
+def _slice_window(t: np.ndarray, x: np.ndarray, t_start: float, t_end: float):
+    """Return rows of ``x`` whose timestamp lies in [t_start, t_end]. ``x``
+    can be 1-D or 2-D. Cheap; segments are usually short."""
+    if t.size == 0:
+        return x[:0]
+    mask = (t >= t_start) & (t <= t_end)
+    return x[mask]
+
+
+def _per_segment_stats(snap: dict, segs: list[tuple[float, float, str]]) -> list[dict]:
+    """For each (t_start, t_end, mode) segment, compute per-group joint
+    stats and IMU summary. Returns a list of dicts ready to render."""
+    rows: list[dict] = []
+    t_imu = snap.get("t_imu", np.empty(0))
+    quats = snap.get("imu_quat_wxyz", np.empty((0, 4)))
+    angvel = snap.get("imu_angvel", np.empty((0, 3)))
+
+    for s, e, mode in segs:
+        row: dict = {"t_start": s, "t_end": e, "mode": mode,
+                     "duration_s": max(e - s, 0.0)}
+        for g in GROUPS:
+            t_st = snap[f"t_state_{g.name}"]
+            eff = snap[f"state_eff_{g.name}"]
+            vel = snap[f"state_vel_{g.name}"]
+            t_cmd = snap[f"t_cmd_{g.name}"]
+            kp = snap[f"cmd_kp_{g.name}"]
+            kd = snap[f"cmd_kd_{g.name}"]
+
+            eff_w = _slice_window(t_st, eff, s, e)
+            vel_w = _slice_window(t_st, vel, s, e)
+            kp_w = _slice_window(t_cmd, kp, s, e)
+            kd_w = _slice_window(t_cmd, kd, s, e)
+
+            row[f"eff_rms_{g.name}"] = (
+                float(np.sqrt(np.nanmean(eff_w ** 2))) if eff_w.size else float("nan")
+            )
+            row[f"vel_rms_{g.name}"] = (
+                float(np.sqrt(np.nanmean(vel_w ** 2))) if vel_w.size else float("nan")
+            )
+            row[f"kp_mean_{g.name}"] = (
+                float(np.nanmean(np.abs(kp_w))) if kp_w.size else float("nan")
+            )
+            row[f"kd_mean_{g.name}"] = (
+                float(np.nanmean(np.abs(kd_w))) if kd_w.size else float("nan")
+            )
+
+        if t_imu.size > 0 and quats.size > 0:
+            q_w = _slice_window(t_imu, quats, s, e)
+            av_w = _slice_window(t_imu, angvel, s, e)
+            tilt_max = float("nan")
+            if q_w.shape[0] > 0:
+                tilts = []
+                for j in range(q_w.shape[0]):
+                    qw, qx, qy, qz = q_w[j]
+                    gz = -(qw * qw - qx * qx - qy * qy + qz * qz)
+                    tilts.append(math.degrees(math.acos(max(-1.0, min(1.0, -gz)))))
+                tilt_max = float(np.max(tilts)) if tilts else float("nan")
+            row["tilt_max_deg"] = tilt_max
+            if av_w.size > 0:
+                row["angvel_max"] = float(np.max(np.linalg.norm(av_w, axis=1)))
+                row["angvel_mean"] = float(np.mean(np.linalg.norm(av_w, axis=1)))
+            else:
+                row["angvel_max"] = float("nan")
+                row["angvel_mean"] = float("nan")
+        else:
+            row["tilt_max_deg"] = float("nan")
+            row["angvel_max"] = float("nan")
+            row["angvel_mean"] = float("nan")
+
+        rows.append(row)
+    return rows
+
+
+def _print_mc_mode_summary(snap: dict, duration_s: float) -> None:
+    t_mode = snap.get("t_mc_mode")
+    mode_str = snap.get("mc_mode_str")
+    if (t_mode is None or mode_str is None
+            or t_mode.size == 0 or mode_str.size == 0):
+        return
+    segs = _segment_by_mode(t_mode, mode_str, duration_s)
+    if not segs:
+        print()
+        print("MC mode timeline: no successful GetMcAction polls "
+              "(service unavailable on the bus).")
+        return
+    rows = _per_segment_stats(snap, segs)
+    print()
+    print(f"MC mode timeline ({len(segs)} segment(s), "
+          f"{sum(r['duration_s'] for r in rows):.1f} s of labelled coverage):")
+    hdr = (
+        f"  {'t_start':>7}  {'t_end':>7}  {'dur':>5}  {'mode':<22}"
+        f"  {'kp_arm':>7}  {'eff_arm':>8}  {'eff_leg':>8}"
+        f"  {'tilt_max':>9}  {'avel_max':>9}"
+    )
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+    for r in rows:
+        print(
+            f"  {r['t_start']:7.2f}  {r['t_end']:7.2f}  {r['duration_s']:5.2f}  "
+            f"{r['mode'][:22]:<22}  "
+            f"{r['kp_mean_arm']:7.2f}  {r['eff_rms_arm']:8.2f}  "
+            f"{r['eff_rms_leg']:8.2f}  "
+            f"{r['tilt_max_deg']:8.1f}d  {r['angvel_max']:8.2f}"
+        )
+
+    # Label inference -- aggregate over all visits to each mode.
+    by_mode: dict[str, list[dict]] = {}
+    for r in rows:
+        by_mode.setdefault(r["mode"], []).append(r)
+
+    def _avg(rs: list[dict], key: str) -> float:
+        vals = [r[key] for r in rs if not math.isnan(r.get(key, float("nan")))]
+        return float(np.mean(vals)) if vals else float("nan")
+
+    def _max_of(rs: list[dict], key: str) -> float:
+        vals = [r[key] for r in rs if not math.isnan(r.get(key, float("nan")))]
+        return float(np.max(vals)) if vals else float("nan")
+
+    print()
+    print("Per-mode aggregate (averaged across segment visits):")
+    print(f"  {'mode':<22}  {'visits':>6}  {'eff_rms_leg':>11}  "
+          f"{'eff_rms_arm':>11}  {'vel_rms_leg':>11}  "
+          f"{'tilt_max':>9}  {'avel_mean':>9}")
+    print("  " + "-" * 90)
+    for mode in sorted(by_mode):
+        rs = by_mode[mode]
+        print(
+            f"  {mode[:22]:<22}  {len(rs):>6}  "
+            f"{_avg(rs, 'eff_rms_leg'):11.2f}  "
+            f"{_avg(rs, 'eff_rms_arm'):11.2f}  "
+            f"{_avg(rs, 'vel_rms_leg'):11.4f}  "
+            f"{_max_of(rs, 'tilt_max_deg'):8.1f}d  "
+            f"{_avg(rs, 'angvel_mean'):9.3f}"
+        )
+
+    # Heuristic labels.
+    print()
+    print("Inferred labels (heuristic; cross-check against MC docs):")
+    for mode in sorted(by_mode):
+        rs = by_mode[mode]
+        eff_leg = _avg(rs, "eff_rms_leg")
+        eff_arm = _avg(rs, "eff_rms_arm")
+        vel_leg = _avg(rs, "vel_rms_leg")
+        tilt_max = _max_of(rs, "tilt_max_deg")
+        if math.isnan(eff_leg) or math.isnan(eff_arm):
+            label = "(insufficient data)"
+        elif eff_leg < 0.5 and eff_arm < 0.5:
+            label = "zero-torque (motors idle / passive)"
+        elif eff_leg < 2.0 and eff_arm < 2.0 and (
+                math.isnan(vel_leg) or vel_leg < 0.05):
+            label = "damping only (low effort, near-zero velocity)"
+        elif tilt_max < 5.0:
+            label = "active balance (sustained effort, tilt bounded)"
+        elif eff_leg > 2.0:
+            label = "active controller (significant effort but tilt > 5deg "
+            label += "-- pushed or commanded motion)"
+        else:
+            label = "(ambiguous)"
+        print(f"  {mode[:22]:<22}  -> {label}")
+    print()
+    print("  Note: cmd_kp / cmd_kd reflect what *we* (the recorder host) "
+          "publish on the bus; in this probe we publish nothing, so all "
+          "kp/kd here are 0. The discriminator across MC modes is the "
+          "actually-applied joint torque (state_eff) and the IMU response, "
+          "both observed via HAL.")
+
+
 def _print_imu_summary(snap: dict) -> None:
     quats = snap.get("imu_quat_wxyz")
     angvel = snap.get("imu_angvel")
@@ -597,6 +917,7 @@ def _summarize(snap: dict, meta: dict, moving_threshold: float) -> None:
     _print_movement_table(snap, moving_threshold)
     _print_arm_spotlight(snap)
     _print_imu_summary(snap)
+    _print_mc_mode_summary(snap, duration)
     print()
 
 
@@ -650,6 +971,8 @@ def cmd_record(args: argparse.Namespace) -> int:
             imu_topic=args.imu_topic,
             status_period_s=args.status_period,
             quiet=args.quiet,
+            track_mc_mode=args.track_mc_mode,
+            mc_poll_hz=args.mc_poll_hz,
         )
         executor.add_node(node)
 
@@ -759,6 +1082,16 @@ def main() -> int:
     p.add_argument("--summarize", type=str, default=None,
                    help="Skip recording and re-print the summary on an "
                         "existing .npz produced by a prior run.")
+    p.add_argument("--track-mc-mode", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Periodically poll /aimdk_5Fmsgs/srv/GetMcAction "
+                        "and store the MC mode timeline alongside the "
+                        "joint/IMU streams. Soft-fails if the service is "
+                        "unavailable.")
+    p.add_argument("--mc-poll-hz", type=float, default=5.0,
+                   help="Poll rate for GetMcAction. 5 Hz is a good "
+                        "compromise between transition resolution (~200 ms) "
+                        "and cross-host service load.")
     args = p.parse_args()
 
     if args.summarize:
