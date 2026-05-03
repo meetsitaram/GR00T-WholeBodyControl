@@ -31,8 +31,46 @@ DEPLOY_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 USER_CWD="$(pwd)"
 
 NC='\033[0m'
+RED='\033[0;31m'
 BLUE='\033[0;34m'
 YELLOW='\033[1;33m'
+
+# Mirror of deploy_x2.sh::is_host_persistent_path. Returns 0 if the
+# (absolute) path lives on a host bind-mount that survives container
+# exit; 1 otherwise. Outside docker, every path is persistent.
+# Bind-mounts established by docker_x2/docker-compose.yml + the -v flag
+# below: /workspace/sonic (repo) and $HOME (operator home). /tmp is
+# ephemeral; --rm reaps it.
+is_host_persistent_path() {
+    local p="$1"
+    [[ "${X2_RECORD_IN_DOCKER:-0}" != "1" ]] && return 0
+    [[ -z "$p" ]] && return 1
+    case "$p" in
+        /workspace/sonic|/workspace/sonic/*) return 0 ;;
+        "$HOME"|"$HOME"/*)                   return 0 ;;
+        *)                                   return 1 ;;
+    esac
+}
+
+assert_host_persistent_path() {
+    local label="$1"
+    local p="$2"
+    if is_host_persistent_path "$p"; then
+        return 0
+    fi
+    echo -e "${RED}ERROR: $label resolves to '$p' inside the docker container.${NC}" >&2
+    echo -e "${RED}       That path is on the container's ephemeral writable layer${NC}" >&2
+    echo -e "${RED}       (--rm reaps it on exit), so the recording would be lost${NC}" >&2
+    echo -e "${RED}       the moment the run finishes.${NC}" >&2
+    echo "" >&2
+    echo -e "${YELLOW}       Persistent locations inside this container:${NC}" >&2
+    echo -e "${YELLOW}         /workspace/sonic/...   (repo, recommended)${NC}" >&2
+    echo -e "${YELLOW}         $HOME/...              (operator home)${NC}" >&2
+    echo "" >&2
+    echo -e "${YELLOW}       Re-run with e.g.:${NC}" >&2
+    echo -e "${YELLOW}         --out scratch/runs/x2_run_\$(date +%Y%m%d_%H%M%S).npz${NC}" >&2
+    exit 1
+}
 
 maybe_relaunch_in_docker() {
     if [[ -d /workspace/sonic ]] || [[ -n "${X2_RECORD_IN_DOCKER:-}" ]]; then
@@ -122,5 +160,36 @@ for a in "$@"; do
         *) forward_args+=("$a") ;;
     esac
 done
+
+# Inside the docker re-exec, walk the forwarded args and refuse if --out
+# resolves to a path on the ephemeral writable layer. Same guard the
+# deploy_x2.sh recorder integration uses; mirrored here for the
+# standalone path. Only --out matters: --summarize is a read; --note,
+# --duration, etc. don't touch disk.
+if [[ "${X2_RECORD_IN_DOCKER:-0}" == "1" ]]; then
+    i=0
+    while (( i < ${#forward_args[@]} )); do
+        a="${forward_args[i]}"
+        case "$a" in
+            --out)
+                v="${forward_args[i+1]:-}"
+                # Resolve to absolute against the operator's invocation cwd
+                # (the docker re-exec preserves USER_CWD via -w).
+                if [[ -n "$v" ]] && [[ "$v" != /* ]]; then
+                    v="$USER_CWD/$v"
+                fi
+                assert_host_persistent_path "--out" "$v"
+                ;;
+            --out=*)
+                v="${a#--out=}"
+                if [[ -n "$v" ]] && [[ "$v" != /* ]]; then
+                    v="$USER_CWD/$v"
+                fi
+                assert_host_persistent_path "--out" "$v"
+                ;;
+        esac
+        (( i++ )) || true
+    done
+fi
 
 exec python3 "$RECORDER" "${forward_args[@]}"

@@ -406,7 +406,10 @@ Optional deploy flags (forwarded to ros2 run):
                               the deploy launches, stops on script exit
                               (Ctrl-C-safe: trap finalises the npz). Output
                               defaults to --log-dir/run.npz, or
-                              /tmp/x2_run_<ts>.npz when --log-dir is unset.
+                              <repo>/scratch/runs/x2_run_<ts>/run.npz when
+                              --log-dir is unset (host bind-mounted so it
+                              survives container --rm; never /tmp inside
+                              docker -- that's the ephemeral writable layer).
                               Use scripts/x2_record_real_run.py --summarize
                               PATH.npz to print the cmd/state/track-err
                               tables.
@@ -657,7 +660,7 @@ Examples:
   $0 onbot \\
       --model /opt/x2_models/model_step_016000_g1.onnx \\
       --motion /opt/x2_motions/standing.x2m2 \\
-      --log-dir /tmp/x2_powered_\$(date +%Y%m%d_%H%M%S)
+      --log-dir scratch/runs/x2_powered_\$(date +%Y%m%d_%H%M%S)
 
   # Closed-loop sim in MuJoCo with viewer (no robot needed):
   $0 sim \\
@@ -789,22 +792,74 @@ abspath() {
     echo "$USER_CWD/$p"
 }
 
+# Returns 0 if the (already-absolute) path lives on a host bind-mount that
+# survives container exit; 1 otherwise. Outside docker, every path is
+# persistent. Inside docker (X2_DEPLOY_IN_DOCKER=1), only the bind-mounts
+# established by docker_x2/docker-compose.yml + maybe_relaunch_in_docker
+# survive --rm:
+#   /workspace/sonic   <- repo root (../..)
+#   $HOME              <- operator home (deploy_x2.sh -v)
+# /tmp, /var/tmp, /root/anything-else, etc. are reaped on container exit.
+is_host_persistent_path() {
+    local p="$1"
+    [[ "${X2_DEPLOY_IN_DOCKER:-0}" != "1" ]] && return 0
+    [[ -z "$p" ]] && return 1
+    case "$p" in
+        /workspace/sonic|/workspace/sonic/*) return 0 ;;
+        "$HOME"|"$HOME"/*)                   return 0 ;;
+        *)                                   return 1 ;;
+    esac
+}
+
+# Aborts with a helpful error if $2 is on the container's ephemeral
+# writable layer. $1 is a human-readable label for the offending knob.
+assert_host_persistent_path() {
+    local label="$1"
+    local p="$2"
+    if is_host_persistent_path "$p"; then
+        return 0
+    fi
+    echo -e "${RED}ERROR: $label resolves to '$p' inside the docker container.${NC}" >&2
+    echo -e "${RED}       That path is on the container's ephemeral writable layer${NC}" >&2
+    echo -e "${RED}       (--rm reaps it on exit), so the recording / CSVs would be${NC}" >&2
+    echo -e "${RED}       lost the moment the run finishes.${NC}" >&2
+    echo "" >&2
+    echo -e "${YELLOW}       Host bind-mounts that DO persist inside this container:${NC}" >&2
+    echo -e "${YELLOW}         /workspace/sonic/...   (repo root, recommended for run logs)${NC}" >&2
+    echo -e "${YELLOW}         $HOME/...              (operator home)${NC}" >&2
+    echo "" >&2
+    echo -e "${YELLOW}       Re-run with e.g.:${NC}" >&2
+    echo -e "${YELLOW}         --log-dir scratch/runs/x2_run_\$(date +%Y%m%d_%H%M%S)${NC}" >&2
+    echo -e "${YELLOW}         --record-out scratch/runs/my_run/run.npz${NC}" >&2
+    exit 1
+}
+
 if [[ "$MODE" == "local" || "$MODE" == "sim" ]]; then
     [[ -n "$MODEL" ]] && MODEL="$(abspath "$MODEL")"
     [[ -n "$MOTION" ]] && MOTION="$(abspath "$MOTION")"
     [[ -n "$LOG_DIR" ]] && LOG_DIR="$(abspath "$LOG_DIR")"
 
     # Default --record output: alongside the per-tick CSVs in --log-dir if
-    # set, otherwise a tempfile keyed off launch time. Only computed if the
+    # set, otherwise an auto-stamped dir under the bind-mounted repo so
+    # the .npz survives `--rm` container teardown. Only computed if the
     # operator asked for --record but didn't override via --record-out.
+    # NOTE: we deliberately do NOT default to /tmp -- that's the trap that
+    # cost us the iter-16k real run on 2026-05-02. See
+    # is_host_persistent_path() above.
     if $RECORD_RUN && [[ -z "$RECORD_OUT" ]]; then
         if [[ -n "$LOG_DIR" ]]; then
             RECORD_OUT="$LOG_DIR/run.npz"
         else
-            RECORD_OUT="/tmp/x2_run_$(date +%Y%m%d_%H%M%S).npz"
+            RECORD_OUT="$(cd "$SCRIPT_DIR/.." && pwd)/scratch/runs/x2_run_$(date +%Y%m%d_%H%M%S)/run.npz"
         fi
     fi
     [[ -n "$RECORD_OUT" ]] && RECORD_OUT="$(abspath "$RECORD_OUT")"
+
+    # Refuse to run if --log-dir / --record-out would land on the
+    # container's ephemeral layer. Better to fail before the docker
+    # spin-up than to discover afterwards that the run is lost.
+    [[ -n "$LOG_DIR" ]]    && assert_host_persistent_path "--log-dir"    "$LOG_DIR"
+    [[ -n "$RECORD_OUT" ]] && assert_host_persistent_path "--record-out" "$RECORD_OUT"
 fi
 # onbot also needs an absolute MOTION path (so abspath sees the local file
 # before we rsync it over) -- the rsync block reads $MOTION as a local path.
