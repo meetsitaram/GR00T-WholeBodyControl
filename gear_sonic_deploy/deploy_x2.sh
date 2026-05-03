@@ -2474,6 +2474,18 @@ else
         # before stop_app). At that point MC is still running and the
         # bg deploy is in STANDBY (silent) -- safe to SIGTERM it. Does
         # NOT touch MC.
+        #
+        # IMPORTANT: stop the run recorder FIRST so its npz is flushed
+        # to disk before this shell exits. The recorder subscribes to
+        # MC's /aima/hal/joint/*/state and /command topics from the
+        # moment start_run_recorder runs (well before the safety gate),
+        # so the npz captures the pre-'y' window where MC is the only
+        # active publisher. Without this call, Ctrl-C at the gate kills
+        # the recorder process without giving it a chance to save the
+        # npz -- which is why /scratch/runs/x2_run_2026..../run.npz
+        # was missing for runs the operator aborted at the gate on
+        # 2026-05-03 (waist-runaway emergency-stop incident).
+        stop_run_recorder
         if [[ -n "$DEPLOY_PID" ]] && kill -0 "$DEPLOY_PID" 2>/dev/null; then
             echo -e "$(ts) ${YELLOW}[handoff]${NC} cancelling: SIGTERM-ing background deploy (pid $DEPLOY_PID)."
             kill -TERM "$DEPLOY_PID" 2>/dev/null || true
@@ -2566,6 +2578,20 @@ else
         echo -e "${YELLOW}    [ ] Robot is firmly supported (gantry / harness / hand-held)${NC}"
         echo -e "${YELLOW}    [ ] No personnel within arm or leg reach of robot${NC}"
         echo -e "${YELLOW}    [ ] You are ready for slight settling motion when MC releases${NC}"
+        # Recorder liveness check. start_run_recorder ran several lines
+        # back; this banner is the operator's last chance to confirm
+        # that the npz pipeline is up before they Ctrl-C at the prompt
+        # (which now flushes the recording on the way out -- see
+        # cleanup_bg_deploy_on_cancel). If --record was not passed, fall
+        # through silently.
+        if $RECORD_RUN; then
+            if [[ -n "$RUN_RECORD_PID" ]] && kill -0 "$RUN_RECORD_PID" 2>/dev/null; then
+                echo -e "${GREEN}    [ ] Recorder LIVE (pid $RUN_RECORD_PID) -> $RECORD_OUT${NC}"
+                echo -e "${GREEN}        (Ctrl-C at this prompt is also captured -- npz will be flushed)${NC}"
+            else
+                echo -e "${RED}    [!] Recorder is NOT running -- pre-'y' state will not be captured.${NC}"
+            fi
+        fi
         if ! $DRY_RUN; then
             echo -e "${RED}    [ ] E-stop is within reach (this is NOT a dry-run)${NC}"
         fi
