@@ -24,10 +24,19 @@
  *
  * ## State machine
  *
- *   INIT -> WAIT_FOR_CONTROL -> CONTROL -> SAFE_HOLD
- *     ^                                       |
- *     +---------------------------------------+
+ *   STANDBY -> INIT -> WAIT_FOR_CONTROL -> CONTROL -> SAFE_HOLD
+ *               ^                                       |
+ *               +---------------------------------------+
  *
+ *   STANDBY          : OPTIONAL pre-INIT state, only entered when
+ *                       --start-trigger-sentinel is set. ROS subscribers
+ *                       are active, ONNX is loaded, MC-takeover detectors
+ *                       armed -- but the 500 Hz writer is GATED OFF (no
+ *                       joint commands published). bash uses this to
+ *                       launch the binary BEFORE stop_app + safety gate
+ *                       so colcon build / DDS discovery / model load
+ *                       overlap with the operator's "Y" decision. Exits
+ *                       to INIT when bash touches the trigger sentinel.
  *   INIT             : waiting for first leg/waist/arm/head/IMU message
  *                       (AimdkIo::AllStateFresh(0.5)). Publishes nothing.
  *   WAIT_FOR_CONTROL : have valid state, waiting for operator "go" via
@@ -59,16 +68,21 @@
 #include "proprioception_buffer.hpp"
 #include "reference_motion.hpp"
 #include "safety.hpp"
+#include "stand_pose_loader.hpp"
 #include "tokenizer_obs.hpp"
 
+#include <aimdk_msgs/msg/joint_command_array.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/subscription_options.hpp>
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <csignal>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -154,6 +168,86 @@ struct CliArgs {
   // Used for debugging policy divergence on the real robot. See
   // docs/source/references/x2_deployment_code.md for the file format.
   std::string obs_dump_path;
+  // ────────────────────────────────────────────────────────────────────
+  // End-of-run smooth handoff (HOLD_FOR_MC).
+  //
+  // Default policy: when --max-duration trips, after RAMP_OUT lerps back
+  // to the trained ``default_angles``, the deploy node exits and bash
+  // POSTs start_app to bring MC back. The robot is therefore in zero
+  // torque (PASSIVE_DEFAULT) for the ~5-15 s MC takes to boot. To close
+  // that window, the deploy node can stay alive in a ``HOLD_FOR_MC``
+  // state holding MC's STAND_DEFAULT pose, while bash drives MC back.
+  // The deploy node detects MC's takeover by listening on
+  // /aima/hal/joint/{leg,waist}/command for any non-self publisher and
+  // exits cleanly the moment MC's first message arrives. Sentinel file
+  // is touched on entering HOLD_FOR_MC so bash can sequence start_app.
+  // ────────────────────────────────────────────────────────────────────
+  // Path to the stand-pose YAML produced by the capture script. Empty
+  // = fall back to default_angles for both RAMP_OUT and HOLD_FOR_MC
+  // (legacy behaviour). See configs/x2_stand_default_pose.yaml.
+  std::string stand_pose_path;
+  // Cap on time spent in HOLD_FOR_MC. <=0 disables HOLD_FOR_MC entirely
+  // (RAMP_OUT exits the process directly, like before). When >0, the
+  // deploy node holds MC's stand pose for up to N seconds waiting for
+  // MC's bus takeover, then exits with a warning if MC never came back.
+  double      hold_for_mc_timeout_s = 0.0;
+  // If non-empty, touch this file when the deploy node enters
+  // HOLD_FOR_MC. Lets bash know "policy phase is done; you can now
+  // start_app + SetMcAction(STAND_DEFAULT) safely" without parsing
+  // stdout. Cleared on clean exit.
+  std::string hold_for_mc_sentinel;
+  // If non-empty, HOLD_FOR_MC stops auto-exiting on the first detected
+  // MC publish (because MC boots in PASSIVE_DEFAULT = zero torque, and
+  // exiting then would let the robot go limp). Instead, deploy waits
+  // for THIS sentinel to appear -- bash creates it after escalating MC
+  // all the way to STAND_DEFAULT. The MC-takeover detector subscribers
+  // are still armed (and logged for diagnostics), they just don't
+  // trigger exit. The hold_for_mc_timeout_s safety cap still applies.
+  std::string hold_for_mc_exit_sentinel;
+  // If non-empty, deploy touches this file the moment it sees its
+  // FIRST non-self publisher on /aima/hal/joint/{leg,waist}/command
+  // (= MC has started publishing again, very likely in
+  // PASSIVE_DEFAULT). Bash uses this as a fast signal to start the
+  // SetMcAction(JOINT_DEFAULT) escalation immediately, BYPASSING the
+  // slow mc_get_action poll loop (which can lag MC's actual first
+  // publish by 0.5-0.8 s on the standing-gestures runs). Combined
+  // with a fast-poll mode-check in bash, this compresses the
+  // PASSIVE_DEFAULT dwell time (= dual-publisher whir window) from
+  // ~1.5 s to roughly the SetMcAction round-trip latency. Independent
+  // of hold_for_mc_exit_sentinel; touching mc_first_publish_sentinel
+  // does NOT trigger exit on its own.
+  std::string mc_first_publish_sentinel;
+  // ────────────────────────────────────────────────────────────────────
+  // Pre-launch STANDBY (cold-warm boot).
+  //
+  // Default flow without these flags is "deploy starts, immediately
+  // tries to enter INIT, the writer streams the safe-hold latch from
+  // the moment it has fresh state". That assumes MC is already stopped
+  // before the binary launches -- otherwise MC + deploy would fight on
+  // the bus during the startup window. The bash script enforces this
+  // by stop_app'ing MC before `ros2 run`.
+  //
+  // The bash script can flip the order so the C++ binary starts BEFORE
+  // the operator confirms the safety gate (cold-warm boot: build, ONNX
+  // load, ROS subscribers settle while the operator is still reading
+  // the prompt). For that, we need a "alive but silent" state where
+  // the writer publishes nothing, so deploy doesn't dual-publish with
+  // MC. STANDBY is that state, and start_trigger_sentinel is how bash
+  // (post-stop_app + verify) tells us "you can take the bus now". When
+  // start_trigger_sentinel is empty we skip STANDBY entirely and behave
+  // exactly like before.
+  // ────────────────────────────────────────────────────────────────────
+  // If non-empty, deploy boots into STANDBY (no publishing) and stays
+  // there until this file exists. Once it does, STANDBY -> INIT and
+  // the rest of the state machine runs as normal. Bash is responsible
+  // for stop_app'ing MC BEFORE touching this file.
+  std::string start_trigger_sentinel;
+  // If non-empty, deploy touches this file once it has reached its
+  // ready point (subscribers up, ONNX loaded, MC-takeover detectors
+  // armed) so bash can show its safety-gate prompt with confidence
+  // that the next step (touch start_trigger_sentinel) is sub-second.
+  // Independent of start_trigger_sentinel; safe to use on its own.
+  std::string ready_sentinel;
 };
 
 void PrintUsage()
@@ -207,6 +301,55 @@ void PrintUsage()
       << "                             Pair with --dry-run + --autostart-after for a\n"
       << "                             deterministic capture from a known robot pose.\n"
       << "                             See compare_deploy_vs_isaaclab_obs.py.\n"
+      << "  --stand-default-pose PATH  YAML file capturing MC's STAND_DEFAULT pose\n"
+      << "                             (configs/x2_stand_default_pose.yaml). When\n"
+      << "                             provided, RAMP_OUT lerps to *this* pose and\n"
+      << "                             HOLD_FOR_MC publishes it -- so the joints land\n"
+      << "                             exactly where MC will resume from, eliminating\n"
+      << "                             the takeover step. Empty = use default_angles\n"
+      << "                             (legacy: ~12-34 deg snap on takeover).\n"
+      << "  --hold-for-mc-timeout-s SECONDS\n"
+      << "                             Stay alive after RAMP_OUT for up to SECONDS,\n"
+      << "                             holding MC's STAND_DEFAULT pose, until MC's\n"
+      << "                             first joint command arrives on the bus (then\n"
+      << "                             exit cleanly). 0 = disabled (legacy: exit at\n"
+      << "                             end of RAMP_OUT, MC bus is silent until bash\n"
+      << "                             POSTs start_app). Recommended: 15.\n"
+      << "  --hold-for-mc-sentinel PATH\n"
+      << "                             Touch PATH on entering HOLD_FOR_MC. Used by\n"
+      << "                             deploy_x2.sh to sequence start_app +\n"
+      << "                             SetMcAction(STAND_DEFAULT) at the right\n"
+      << "                             moment. Empty = no sentinel.\n"
+      << "  --hold-for-mc-exit-sentinel PATH\n"
+      << "                             When set, HOLD_FOR_MC stops auto-exiting on\n"
+      << "                             the first MC publish (because MC boots in\n"
+      << "                             PASSIVE_DEFAULT = zero torque -- exiting then\n"
+      << "                             would let the robot go limp). Instead, the\n"
+      << "                             deploy node waits for PATH to appear; bash\n"
+      << "                             creates it once MC has been escalated all the\n"
+      << "                             way back to STAND_DEFAULT. The hold-for-mc\n"
+      << "                             timeout is still a hard upper bound.\n"
+      << "  --mc-first-publish-sentinel PATH\n"
+      << "                             Touch PATH the moment the takeover detector\n"
+      << "                             sees its first non-self publisher on\n"
+      << "                             /aima/hal/joint/{leg,waist}/command (= MC\n"
+      << "                             has come back online, likely in PASSIVE).\n"
+      << "                             bash uses this as a fast trigger to start\n"
+      << "                             SetMcAction(JOINT_DEFAULT) without waiting\n"
+      << "                             for MC's mode service to respond. Does NOT\n"
+      << "                             trigger exit on its own (see exit-sentinel).\n"
+      << "  --start-trigger-sentinel PATH\n"
+      << "                             Boot into STANDBY (writer suppressed) and wait\n"
+      << "                             for PATH to exist before advancing to INIT.\n"
+      << "                             Lets bash launch deploy AHEAD of stop_app +\n"
+      << "                             safety gate to overlap colcon build / ONNX\n"
+      << "                             load / DDS discovery with the operator's\n"
+      << "                             confirmation. Empty = boot straight to INIT.\n"
+      << "  --ready-sentinel PATH      Touch PATH on the first STANDBY tick to tell\n"
+      << "                             bash that subscribers / ONNX / takeover\n"
+      << "                             detectors are armed and the safety gate can\n"
+      << "                             be shown. Independent of start-trigger; safe\n"
+      << "                             to use on its own.\n"
       << "  --help, -h                 show this help\n";
 }
 
@@ -237,6 +380,19 @@ CliArgs ParseCli(int argc, char** argv)
     else if (s == "--intra-op-threads")  a.intra_op_threads  = std::stoi(next("--intra-op-threads"));
     else if (s == "--imu-topic")         a.imu_topic         = next("--imu-topic");
     else if (s == "--obs-dump")          a.obs_dump_path     = next("--obs-dump");
+    else if (s == "--stand-default-pose") a.stand_pose_path  = next("--stand-default-pose");
+    else if (s == "--hold-for-mc-timeout-s")
+      a.hold_for_mc_timeout_s = std::stod(next("--hold-for-mc-timeout-s"));
+    else if (s == "--hold-for-mc-sentinel")
+      a.hold_for_mc_sentinel = next("--hold-for-mc-sentinel");
+    else if (s == "--hold-for-mc-exit-sentinel")
+      a.hold_for_mc_exit_sentinel = next("--hold-for-mc-exit-sentinel");
+    else if (s == "--mc-first-publish-sentinel")
+      a.mc_first_publish_sentinel = next("--mc-first-publish-sentinel");
+    else if (s == "--start-trigger-sentinel")
+      a.start_trigger_sentinel = next("--start-trigger-sentinel");
+    else if (s == "--ready-sentinel")
+      a.ready_sentinel = next("--ready-sentinel");
     else {
       throw std::runtime_error("unknown argument: " + s);
     }
@@ -252,7 +408,51 @@ CliArgs ParseCli(int argc, char** argv)
 // ---------------------------------------------------------------------------
 class X2Deploy {
  public:
-  enum class State { INIT, WAIT_FOR_CONTROL, CONTROL, RAMP_OUT, SAFE_HOLD };
+  // STANDBY -> INIT -> WAIT_FOR_CONTROL -> CONTROL -> RAMP_OUT -> HOLD_FOR_MC
+  //              ^                                       |
+  //              +---------------------------------------+
+  //                                                      |
+  //                                                      v
+  //                                                  SAFE_HOLD (terminal)
+  //
+  // STANDBY is an optional "alive but silent" state at the head of the
+  // state machine, used when --start-trigger-sentinel is set. In STANDBY:
+  //   * subscribers are active (ROS state is being collected so the
+  //     INIT->WAIT freshness check passes immediately on transition)
+  //   * the 500 Hz writer is GATED OFF (no joint commands published)
+  //   * we poll the start-trigger sentinel each control tick (20 ms)
+  // bash uses this to launch deploy in the background AHEAD of the
+  // safety gate (parallelising colcon build / ONNX load / DDS discovery
+  // with the operator reading the prompt). Once the operator confirms
+  // and bash POSTs stop_app + verify, bash touches the trigger sentinel
+  // and we move STANDBY -> INIT in the next tick.
+  //
+  // Without --start-trigger-sentinel deploy boots straight to INIT
+  // (legacy path): bash must stop_app BEFORE launching the binary.
+  //
+  // HOLD_FOR_MC keeps the deploy node alive after RAMP_OUT publishing
+  // MC's STAND_DEFAULT pose with MC-stand kp/kd (firmer than deploy
+  // gains, matching MC's own stiffness for a stable static hold),
+  // until any non-self publisher appears on /aima/hal/joint/{leg,waist}/
+  // command (= MC has taken back over). The exit is fast: the DDS
+  // callback for MC's first publish fires sub-ms after MC enters
+  // JOINT_DEFAULT, and the next OnControl tick exits within <= 20 ms
+  // (50 Hz). The exit-sentinel (touched by deploy_x2.sh once MC is in
+  // STAND_DEFAULT) is honoured as a redundant backup so an external
+  // mode switch (mobile app, ROS service from another shell) can free
+  // us even if the takeover detector misses. On takeover (or on
+  // hold-for-mc-timeout-s timeout) we shut down cleanly. If
+  // --hold-for-mc-timeout-s is 0,
+  // RAMP_OUT exits the process directly (legacy behaviour).
+  enum class State {
+    STANDBY,
+    INIT,
+    WAIT_FOR_CONTROL,
+    CONTROL,
+    RAMP_OUT,
+    HOLD_FOR_MC,
+    SAFE_HOLD,
+  };
 
   X2Deploy(rclcpp::Node::SharedPtr node, const CliArgs& cli)
       : node_(node),
@@ -336,6 +536,107 @@ class X2Deploy {
                   "Deploy will shut down immediately on --max-duration; if the "
                   "policy left joints far from default_angles, the next MC "
                   "start_app POST may snap them back and trip a red fault.");
+    }
+
+    // ─── End-of-run smooth handoff: load MC's STAND_DEFAULT pose ────────
+    // If --stand-default-pose was given, we use the captured pose+kp+kd
+    // for both RAMP_OUT (lerp target) and HOLD_FOR_MC (static publish).
+    // Otherwise we fall back to default_angles + deploy-mode kp/kd, which
+    // mismatches MC's pose by up to 34 deg at the elbows -- the operator
+    // sees an audible pop on takeover. Print a loud diff summary so the
+    // operator notices when the YAML is missing.
+    for (std::size_t i = 0; i < NUM_DOFS; ++i) {
+      stand_pose_target_[i]    = default_angles[i];
+      stand_pose_stiffness_[i] = kps[i];
+      stand_pose_damping_[i]   = kds[i];
+    }
+    if (!cli_.stand_pose_path.empty()) {
+      try {
+        const auto sp = LoadStandPose(cli_.stand_pose_path);
+        double max_diff_rad = 0.0;
+        std::size_t worst_idx = 0;
+        for (std::size_t i = 0; i < NUM_DOFS; ++i) {
+          stand_pose_target_[i]    = sp.position[i];
+          stand_pose_stiffness_[i] = sp.stiffness[i];
+          stand_pose_damping_[i]   = sp.damping[i];
+          const double d = std::abs(sp.position[i] - default_angles[i]);
+          if (d > max_diff_rad) { max_diff_rad = d; worst_idx = i; }
+        }
+        RCLCPP_WARN(node_->get_logger(),
+                    "HANDOFF: loaded MC STAND_DEFAULT pose from '%s' "
+                    "(31 joints). Worst delta vs default_angles: %.3f rad "
+                    "(%.1f deg) at '%s'. RAMP_OUT and HOLD_FOR_MC will "
+                    "target this pose so MC takeover is step-free.",
+                    cli_.stand_pose_path.c_str(),
+                    max_diff_rad,
+                    max_diff_rad * 180.0 / 3.14159265358979323846,
+                    mujoco_joint_names[worst_idx]);
+      } catch (const std::exception& e) {
+        RCLCPP_FATAL(node_->get_logger(),
+                     "HANDOFF: failed to load --stand-default-pose '%s': %s. "
+                     "Aborting (refusing to start with an unknown handoff "
+                     "target). Pass --stand-default-pose '' to fall back to "
+                     "default_angles, or fix the YAML.",
+                     cli_.stand_pose_path.c_str(), e.what());
+        throw;
+      }
+    } else {
+      RCLCPP_WARN(node_->get_logger(),
+                  "HANDOFF: --stand-default-pose not provided; RAMP_OUT and "
+                  "HOLD_FOR_MC will target default_angles. MC takeover may "
+                  "snap up to 34 deg at the elbows. Pass "
+                  "--stand-default-pose configs/x2_stand_default_pose.yaml "
+                  "to eliminate the snap.");
+    }
+
+    if (cli_.hold_for_mc_timeout_s > 0.0) {
+      if (cli_.hold_for_mc_exit_sentinel.empty()) {
+        RCLCPP_WARN(node_->get_logger(),
+                    "HANDOFF: HOLD_FOR_MC enabled (timeout %.1fs). After "
+                    "RAMP_OUT, deploy will keep publishing MC's STAND_DEFAULT "
+                    "pose until MC's first joint command arrives on the bus, "
+                    "then exit cleanly (legacy fast-exit path).",
+                    cli_.hold_for_mc_timeout_s);
+      } else {
+        RCLCPP_WARN(node_->get_logger(),
+                    "HANDOFF: HOLD_FOR_MC enabled (timeout %.1fs). After "
+                    "RAMP_OUT, deploy will keep publishing MC's STAND_DEFAULT "
+                    "pose until bash touches the exit-sentinel '%s' (set after "
+                    "MC has escalated all the way to STAND_DEFAULT). No zero-"
+                    "torque window during MC boot's PASSIVE -> JOINT -> STAND.",
+                    cli_.hold_for_mc_timeout_s,
+                    cli_.hold_for_mc_exit_sentinel.c_str());
+      }
+      InitMcTakeoverDetectors();
+    } else {
+      RCLCPP_WARN(node_->get_logger(),
+                  "HANDOFF: HOLD_FOR_MC disabled (--hold-for-mc-timeout-s "
+                  "<= 0). RAMP_OUT will exit the process; the bus will be "
+                  "silent until bash POSTs start_app.");
+    }
+    if (!cli_.hold_for_mc_sentinel.empty()) {
+      RCLCPP_INFO(node_->get_logger(),
+                  "HANDOFF: HOLD_FOR_MC sentinel = '%s' "
+                  "(touched on entering HOLD_FOR_MC).",
+                  cli_.hold_for_mc_sentinel.c_str());
+    }
+
+    // STANDBY support. If --start-trigger-sentinel is set, boot into
+    // STANDBY (writer suppressed, no joint commands published) and wait
+    // for bash to touch the file before advancing to INIT. This lets
+    // bash launch the binary AHEAD of the safety gate to overlap colcon
+    // build / ONNX load / DDS discovery with the operator's "Y" decision.
+    if (!cli_.start_trigger_sentinel.empty()) {
+      state_.store(State::STANDBY);
+      RCLCPP_WARN(node_->get_logger(),
+                  "STANDBY: --start-trigger-sentinel='%s' provided; deploy "
+                  "is alive but the 500 Hz writer is GATED OFF. Will "
+                  "advance STANDBY -> INIT when this file appears.",
+                  cli_.start_trigger_sentinel.c_str());
+      // Best-effort cleanup of any stale trigger left over from a prior
+      // crash. If the file is owned by another user we may fail; that's
+      // harmless -- bash recreates it fresh.
+      std::remove(cli_.start_trigger_sentinel.c_str());
     }
 
     // Compute the EMA coefficient now so OnControl can apply it without
@@ -434,6 +735,49 @@ class X2Deploy {
     const bool fresh = aimdk_io_->SnapshotState(rs);
 
     switch (cur) {
+      case State::STANDBY: {
+        // Touch the ready sentinel exactly once on the first STANDBY tick
+        // so bash knows our subscribers/timers are live. ROS subscribers
+        // are receiving state in the background while we sit here.
+        if (!standby_ready_logged_) {
+          standby_ready_logged_ = true;
+          if (!cli_.ready_sentinel.empty()) {
+            std::ofstream r(cli_.ready_sentinel, std::ios::trunc);
+            if (!r) {
+              RCLCPP_ERROR(node_->get_logger(),
+                           "STANDBY: failed to touch ready-sentinel '%s' "
+                           "(errno=%d). Bash may show its safety gate "
+                           "without confirmation that deploy is ready.",
+                           cli_.ready_sentinel.c_str(), errno);
+            } else {
+              r << "ready " << now << "\n";
+              RCLCPP_WARN(node_->get_logger(),
+                          "STANDBY: ready-sentinel touched at '%s'. "
+                          "Writer is GATED OFF; waiting for trigger.",
+                          cli_.ready_sentinel.c_str());
+            }
+          } else {
+            RCLCPP_WARN(node_->get_logger(),
+                        "STANDBY: ready (no ready-sentinel configured). "
+                        "Writer is GATED OFF; waiting for trigger.");
+          }
+        }
+        // Poll the trigger sentinel. std::ifstream open is the cheapest
+        // portable existence check; no allocations on the steady-state
+        // miss path.
+        std::ifstream probe(cli_.start_trigger_sentinel);
+        if (probe.good()) {
+          RCLCPP_WARN(node_->get_logger(),
+                      "STANDBY: start-trigger-sentinel '%s' detected; "
+                      "advancing STANDBY -> INIT.",
+                      cli_.start_trigger_sentinel.c_str());
+          // Best-effort cleanup so a second invocation doesn't
+          // immediately re-trigger.
+          std::remove(cli_.start_trigger_sentinel.c_str());
+          state_.store(State::INIT);
+        }
+        return;
+      }
       case State::INIT: {
         if (aimdk_io_->AllStateFresh(0.5)) {
           // Latch the current observed joint pose as the safe-hold target
@@ -542,19 +886,36 @@ class X2Deploy {
       }
       case State::RAMP_OUT: {
         // Soft-EXIT ramp: linearly interpolate target_pos from the snapshot
-        // we took on entering RAMP_OUT (last policy command) toward
-        // default_angles over cli_.return_seconds. We keep deploy-mode kp/kd
-        // active so we actually drive joints back instead of letting them
-        // flop. When the ramp completes we request shutdown -- by then the
-        // joints are at the trained standing pose, so MC's start_app POST
-        // in the cleanup trap won't snap-and-fault.
+        // we took on entering RAMP_OUT (last policy command) toward MC's
+        // STAND_DEFAULT pose (or default_angles if --stand-default-pose was
+        // not given) over cli_.return_seconds. We hold kp/kd at the
+        // deploy-mode values the policy was trained with -- DO NOT lerp
+        // kp/kd toward MC's stand-mode gains, even though we know them.
+        //
+        // Why: MC's STAND_DEFAULT gains have, per joint, very different
+        // damping ratios than the deploy gains (e.g. elbow kp triples
+        // 14 -> 50 while kd barely moves 0.9 -> 1.0; hip kd halves
+        // 6.3 -> 4.0). Lerping kp/kd while the position target is also
+        // moving by up to 1.2 rad over 2 s (elbows, when the policy left
+        // arms extended) produces a transiently under-damped system
+        // chasing a moving setpoint = motor whir + ringing. Verified the
+        // hard way on 2026-05-03; reverted to deploy-mode gains here.
+        // MC will switch to its own gains in a single message at the
+        // takeover boundary, with the position already at the matching
+        // pose, so the gain step is benign (low position error).
+        // We always keep PD active -- never zero torque -- so the body
+        // stays balanced through the whole ramp.
+        // When the ramp completes we either:
+        //   * --hold-for-mc-timeout-s > 0 -> transition to HOLD_FOR_MC
+        //     and wait for MC to take back over the joint command bus;
+        //   * otherwise -> request shutdown (legacy).
         const double T = std::max(cli_.return_seconds, 1e-6);
         const double t = now - ramp_out_entry_s_;
         const double alpha = std::clamp(t / T, 0.0, 1.0);  // 0=start, 1=done
         SafeCommand sc;
         for (std::size_t i = 0; i < NUM_DOFS; ++i) {
           sc.target_pos_mj[i] = (1.0 - alpha) * ramp_out_start_pos_[i]
-                                + alpha * default_angles[i];
+                                + alpha * stand_pose_target_[i];
           sc.stiffness_mj[i]  = cli_.dry_run ? 0.0 : kps[i];
           sc.damping_mj[i]    = cli_.dry_run ? 0.0 : kds[i];
         }
@@ -571,10 +932,189 @@ class X2Deploy {
                     rs.base_quat_wxyz, rs.base_ang_vel,
                     last_action_il_, sc);
         if (alpha >= 1.0) {
+          if (cli_.hold_for_mc_timeout_s > 0.0) {
+            RCLCPP_WARN(node_->get_logger(),
+                        "RAMP_OUT complete (%.2fs) -> HOLD_FOR_MC "
+                        "(timeout %.1fs, waiting for MC to take back over the "
+                        "joint command bus). Position now at MC STAND_DEFAULT "
+                        "pose; HOLD_FOR_MC will step gains up to MC-stand "
+                        "stiffness/damping for a firmer hold (legs, ankles, "
+                        "waist). Position error at the gain step is ~0 so the "
+                        "torque kick is negligible.",
+                        cli_.return_seconds, cli_.hold_for_mc_timeout_s);
+            EnterHoldForMc(now);
+          } else {
+            RCLCPP_WARN(node_->get_logger(),
+                        "RAMP_OUT complete (%.2fs) -> shutting down. "
+                        "Joints commanded back to STAND_DEFAULT pose; safe to "
+                        "hand off to MC.", cli_.return_seconds);
+            rclcpp::shutdown();
+          }
+        }
+        return;
+      }
+      case State::HOLD_FOR_MC: {
+        // Static-pose hold while MC restarts. We publish MC's STAND_DEFAULT
+        // pose with MC-stand kp/kd (loaded from --stand-default-pose YAML;
+        // falls back to deploy gains if the YAML wasn't supplied) so the
+        // legs / ankles / waist are as stiff as MC-STAND would have them
+        // (e.g. waist pitch kp 14 -> 40, knee kp 99 -> 150, ankle kp
+        // 21 -> 30-40). This addresses the operator's "legs and waist
+        // not holding" feedback during the post-policy hold: deploy-mode
+        // gains were tuned for the *active* policy, not for a static
+        // hold against gravity. The gain step at HOLD_FOR_MC entry is
+        // safe because we just ramped position to stand_pose_target_,
+        // so position error is ~0 and the torque kick from the kp step
+        // is small. Note: deploy still has NO active balance controller
+        // -- this hold is "joints stiff, body free to tilt" -- so a
+        // strong perturbation can still tilt the torso. That's the
+        // architectural ceiling until MC takes back over.
+        // We exit when EITHER:
+        //   (a) the MC-takeover detector callback (subscribed to
+        //       /aima/hal/joint/leg/command and /aima/hal/joint/waist/command
+        //       with ignore_local_publications=true) has seen its first
+        //       message from a non-self publisher = MC is publishing again;
+        //   (b) hold_for_mc_timeout_s elapses (MC didn't come back; we
+        //       give up and let bash decide what to do next).
+        SafeCommand sc;
+        for (std::size_t i = 0; i < NUM_DOFS; ++i) {
+          sc.target_pos_mj[i] = stand_pose_target_[i];
+          sc.stiffness_mj[i]  = cli_.dry_run ? 0.0 : stand_pose_stiffness_[i];
+          sc.damping_mj[i]    = cli_.dry_run ? 0.0 : stand_pose_damping_[i];
+        }
+        sc.dry_run    = cli_.dry_run;
+        sc.tilt_trip  = false;
+        sc.ramp_alpha = 0.0;
+        sc.reason     = "hold_for_mc";
+        {
+          std::lock_guard<std::mutex> lk(latest_cmd_mutex_);
+          latest_cmd_ = sc;
+        }
+        latest_cmd_ready_.store(true, std::memory_order_release);
+        logger_.Log(now, rs.joint_pos_mj, rs.joint_vel_mj,
+                    rs.base_quat_wxyz, rs.base_ang_vel,
+                    last_action_il_, sc);
+        // Exit policy (re-revised 2026-05-03 after operator observed
+        // ~1.5 s of zero-torque after deploy released the bus -- the
+        // FAST-EXIT-on-first-publish version had this bug because MC
+        // publishes commands while still in PASSIVE_DEFAULT during boot):
+        //
+        //   PRIMARY GATE: --hold-for-mc-exit-sentinel.
+        //     Bash touches the file after escalating MC all the way to
+        //     STAND_DEFAULT. While the file is absent, deploy keeps
+        //     publishing MC's stand pose with MC-stand gains -- so the
+        //     legs/ankles/waist stay actively held throughout MC's
+        //     PASSIVE -> JOINT -> STAND boot sequence. There IS a brief
+        //     dual-publisher window once MC enters JOINT_DEFAULT (~1 s
+        //     before STAND_DEFAULT activates), but both deploy and MC
+        //     are PD-holding the same stand pose with similar gains, so
+        //     the conflict is small and the robot stays under torque.
+        //
+        //   FALLBACK: first-MC-publish detection (legacy path, no
+        //     exit-sentinel configured). Exits the moment the takeover
+        //     detector fires. Use this only if you've arranged some
+        //     other means of ensuring MC is in a holding mode (not
+        //     PASSIVE) before its first publish.
+        //
+        //   BACKSTOP: hold_for_mc_timeout_s. Hard upper bound on the
+        //     hold so deploy doesn't get stuck if bash crashes.
+        //
+        // First-publish detection is still LOGGED for tracing in both
+        // modes -- it's the most useful timestamp for measuring the
+        // STAND_DEFAULT settle latency from MC's side.
+        const double held       = now - hold_for_mc_entry_s_;
+        const bool   takeover   = mc_takeover_detected_.load(std::memory_order_acquire);
+        if (takeover && !mc_takeover_logged_) {
+          mc_takeover_logged_ = true;
+          // ms-precision delta from HOLD_FOR_MC entry to actual DDS
+          // callback firing. Captured inside the callback before any
+          // locks, so it is independent of OnControl scheduling jitter.
+          using ms_d = std::chrono::duration<double, std::milli>;
+          double dt_ms_callback = -1.0;
+          double dt_ms_now      = -1.0;
+          {
+            std::lock_guard<std::mutex> lk(mc_takeover_topic_mutex_);
+            if (mc_takeover_steady_ts_.time_since_epoch().count() != 0
+                && hold_for_mc_entry_steady_.time_since_epoch().count() != 0) {
+              dt_ms_callback = ms_d(mc_takeover_steady_ts_
+                                    - hold_for_mc_entry_steady_).count();
+            }
+            dt_ms_now = ms_d(std::chrono::steady_clock::now()
+                             - hold_for_mc_entry_steady_).count();
+          }
+          if (cli_.hold_for_mc_exit_sentinel.empty()) {
+            RCLCPP_WARN(node_->get_logger(),
+                        "HOLD_FOR_MC: FIRST MC PUBLISH on '%s' at "
+                        "callback=+%.3f ms, OnControl=+%.3f ms (entry+%.2fs). "
+                        "Exiting -> MC takes the bus alone (no dual-publisher "
+                        "fight). Total handoff latency = "
+                        "callback->next OnControl tick (<= 20 ms).",
+                        mc_takeover_topic_.c_str(),
+                        dt_ms_callback, dt_ms_now, held);
+          } else {
+            RCLCPP_WARN(node_->get_logger(),
+                        "HOLD_FOR_MC: FIRST MC PUBLISH on '%s' at "
+                        "callback=+%.3f ms, OnControl=+%.3f ms (entry+%.2fs). "
+                        "Continuing to publish STAND_DEFAULT pose (MC is "
+                        "likely still in PASSIVE_DEFAULT during boot); "
+                        "waiting for exit-sentinel to fire from bash after "
+                        "MC reaches STAND_DEFAULT.",
+                        mc_takeover_topic_.c_str(),
+                        dt_ms_callback, dt_ms_now, held);
+          }
+        }
+
+        // Exit policy:
+        //   * If an exit-sentinel is configured, the sentinel is the ONLY
+        //     gate. Deploy keeps publishing MC's STAND_DEFAULT pose until
+        //     bash explicitly tells us "MC is in STAND_DEFAULT" by
+        //     touching the file. This is the intended design from the
+        //     original handoff plan: MC boots in PASSIVE_DEFAULT (zero
+        //     torque), then escalates PASSIVE -> JOINT -> STAND. Its
+        //     FIRST publish lands while it's still in PASSIVE; releasing
+        //     the bus then would drop the robot to zero torque for the
+        //     ~1-2 s it takes bash to escalate to STAND_DEFAULT (this
+        //     was the bug the operator observed on 2026-05-03 20:33:33:
+        //     "robot not in control for a couple of seconds before MC
+        //     said switching to standing mode").
+        //   * If no exit-sentinel was configured (legacy callers, or
+        //     a future caller that arbitrates handoff via some other
+        //     channel), fall back to first-MC-publish-detection.
+        //   * The hold_for_mc_timeout_s cap is the ultimate backstop
+        //     in either case.
+        bool should_exit = false;
+        const char* exit_reason = "";
+        if (!cli_.hold_for_mc_exit_sentinel.empty()) {
+          // Exit-sentinel mode (the path bash configures by default).
+          // First-MC-publish detection is informational only here --
+          // we logged it above but do NOT exit on it.
+          std::ifstream probe(cli_.hold_for_mc_exit_sentinel);
+          if (probe.good()) {
+            should_exit = true;
+            exit_reason = "exit-sentinel touched";
+          }
+        } else if (takeover) {
+          should_exit = true;
+          exit_reason = "first MC publish detected (no exit-sentinel configured)";
+        }
+        if (should_exit) {
           RCLCPP_WARN(node_->get_logger(),
-                      "RAMP_OUT complete (%.2fs) -> shutting down. "
-                      "Joints commanded back to default_angles; safe to "
-                      "hand off to MC.", cli_.return_seconds);
+                      "HOLD_FOR_MC: %s after %.2fs -> shutting down. "
+                      "Robot stayed in STAND_DEFAULT pose throughout the "
+                      "handoff (no DAMPING / PASSIVE window).",
+                      exit_reason, held);
+          ClearHoldForMcSentinel();
+          rclcpp::shutdown();
+          return;
+        }
+        if (held >= cli_.hold_for_mc_timeout_s) {
+          RCLCPP_ERROR(node_->get_logger(),
+                       "HOLD_FOR_MC: timed out after %.2fs without bash "
+                       "creating the exit-sentinel. Shutting down anyway -- "
+                       "the bus will go silent. Operator: confirm MC is "
+                       "alive and in STAND_DEFAULT before re-enabling.",
+                       held);
+          ClearHoldForMcSentinel();
           rclcpp::shutdown();
         }
         return;
@@ -786,9 +1326,14 @@ class X2Deploy {
   void OnWriter()
   {
     const State cur = state_.load();
-    if (cur == State::INIT || cur == State::WAIT_FOR_CONTROL) {
+    if (cur == State::STANDBY
+        || cur == State::INIT
+        || cur == State::WAIT_FOR_CONTROL) {
       // Don't publish anything in pre-control states. The robot's last-good
       // command (from whatever was running before us) keeps the joints held.
+      // STANDBY in particular MUST be silent: bash launches us before
+      // stop_app, so MC may still be publishing on this bus -- adding our
+      // commands would make the firmware see a dual-publisher fight.
       return;
     }
     // Skip publishing until OnControl (or RAMP_OUT/SAFE_HOLD) has latched
@@ -833,6 +1378,124 @@ class X2Deploy {
     state_.store(State::SAFE_HOLD);
   }
 
+  // ─── HOLD_FOR_MC support ────────────────────────────────────────────
+  // RAMP_OUT calls EnterHoldForMc() once the lerp completes.
+  void EnterHoldForMc(double now)
+  {
+    hold_for_mc_entry_s_ = now;
+    hold_for_mc_entry_steady_ = std::chrono::steady_clock::now();
+    mc_takeover_detected_.store(false, std::memory_order_release);
+    mc_takeover_logged_ = false;
+    {
+      std::lock_guard<std::mutex> lk(mc_takeover_topic_mutex_);
+      mc_takeover_topic_.clear();
+      mc_takeover_steady_ts_ = std::chrono::steady_clock::time_point{};
+    }
+    if (!cli_.hold_for_mc_sentinel.empty()) {
+      // Touch the sentinel so deploy_x2.sh knows the policy phase is
+      // done and it can fire start_app + SetMcAction(STAND_DEFAULT).
+      // Use std::ofstream so we don't require <unistd.h>; trunc-creates
+      // an empty file on every entry.
+      std::ofstream sentinel(cli_.hold_for_mc_sentinel, std::ios::trunc);
+      if (!sentinel) {
+        RCLCPP_ERROR(node_->get_logger(),
+                     "HOLD_FOR_MC: failed to touch sentinel '%s' (errno "
+                     "= %d). Bash won't sequence start_app; operator "
+                     "will need to bring MC back manually.",
+                     cli_.hold_for_mc_sentinel.c_str(), errno);
+      } else {
+        sentinel << "hold_for_mc " << now << "\n";
+      }
+    }
+    state_.store(State::HOLD_FOR_MC);
+  }
+
+  void ClearHoldForMcSentinel()
+  {
+    if (cli_.hold_for_mc_sentinel.empty()) return;
+    // Best-effort cleanup; if remove fails there's nothing meaningful
+    // we can do (the bash cleanup trap also rm -f's it as a backstop).
+    std::remove(cli_.hold_for_mc_sentinel.c_str());
+  }
+
+  // Called from the constructor when --hold-for-mc-timeout-s > 0.
+  // Subscribes to /aima/hal/joint/leg/command and /aima/hal/joint/waist/command
+  // with ignore_local_publications=true, so OUR command writer's
+  // traffic never trips the detector. The first non-self message on
+  // either topic flips mc_takeover_detected_, which the HOLD_FOR_MC
+  // case in OnControl reads on the next tick to exit cleanly.
+  void InitMcTakeoverDetectors()
+  {
+    rclcpp::SubscriptionOptions opts;
+    opts.ignore_local_publications = true;
+    // Match the QoS of the joint command bus exactly. AimdkIo publishes
+    // on these topics with rclcpp::SensorDataQoS() (best-effort, depth=10);
+    // MC's HAL on PC1 also publishes best-effort. A default rclcpp::QoS()
+    // here is RELIABLE, which is INCOMPATIBLE with MC's best-effort
+    // publisher -- DDS refuses to match and our subscriber receives zero
+    // messages from MC. That is the root cause of the ~1.7 s dual-
+    // publisher whir at the end of the 2026-05-03 run: the takeover
+    // detector never fired, deploy fell back to the slower exit-sentinel
+    // path, and MC + deploy fought on the bus for the full duration of
+    // bash's PASSIVE -> JOINT -> STAND escalation. With matched QoS the
+    // detector callback fires sub-ms after MC's first publish.
+    // ignore_local_publications still suppresses self-traffic at the
+    // GID level, independent of QoS.
+    auto qos = rclcpp::SensorDataQoS();
+    auto on_takeover =
+        [this](const std::string& topic) {
+          // Capture the moment MC took the bus at the highest resolution
+          // we can, BEFORE acquiring any locks, so the timestamp is as
+          // close as possible to "DDS callback fired". steady_clock is
+          // monotonic + ns-precision; we publish the delta vs HOLD_FOR_MC
+          // entry so the operator can correlate against audible whirring.
+          const auto now_steady = std::chrono::steady_clock::now();
+          bool first = false;
+          {
+            std::lock_guard<std::mutex> lk(mc_takeover_topic_mutex_);
+            if (mc_takeover_topic_.empty()) {
+              mc_takeover_topic_ = topic;
+              mc_takeover_steady_ts_ = now_steady;
+              first = true;
+            }
+          }
+          mc_takeover_detected_.store(true, std::memory_order_release);
+          // Touch the early-signal sentinel ONCE on the first publish so
+          // bash can start the JOINT_DEFAULT escalation immediately rather
+          // than polling MC's mode service (which lags MC's actual first
+          // publish by ~0.5-0.8 s). The std::ofstream truncate is fast (a
+          // couple of ms even on EXT4); we do it inside the DDS callback
+          // because the latency from this point to bash seeing the file
+          // matters: every ms we shave here is a ms less of MC-PASSIVE +
+          // deploy dual-publisher whir. Best-effort -- if the open fails
+          // (e.g. dir missing), bash falls back to the mc_get_action poll
+          // path automatically.
+          if (first && !cli_.mc_first_publish_sentinel.empty()) {
+            std::ofstream s(cli_.mc_first_publish_sentinel, std::ios::trunc);
+            if (s) s << "first_publish " << topic << "\n";
+          }
+        };
+    mc_takeover_leg_sub_ =
+        node_->create_subscription<aimdk_msgs::msg::JointCommandArray>(
+            "/aima/hal/joint/leg/command", qos,
+            [on_takeover](aimdk_msgs::msg::JointCommandArray::ConstSharedPtr) {
+              on_takeover("/aima/hal/joint/leg/command");
+            },
+            opts);
+    mc_takeover_waist_sub_ =
+        node_->create_subscription<aimdk_msgs::msg::JointCommandArray>(
+            "/aima/hal/joint/waist/command", qos,
+            [on_takeover](aimdk_msgs::msg::JointCommandArray::ConstSharedPtr) {
+              on_takeover("/aima/hal/joint/waist/command");
+            },
+            opts);
+    RCLCPP_INFO(node_->get_logger(),
+                "HANDOFF: MC-takeover detectors armed on "
+                "/aima/hal/joint/leg/command and "
+                "/aima/hal/joint/waist/command "
+                "(ignore_local_publications=true).");
+  }
+
   // -------------------------------------------------------------------------
   rclcpp::Node::SharedPtr node_;
   CliArgs                 cli_;
@@ -866,6 +1529,9 @@ class X2Deploy {
   std::atomic<bool>                 latest_cmd_ready_{false};
 
   std::atomic<State>                state_{State::INIT};
+  // Latched true the first time OnControl runs in STANDBY -- prevents
+  // the ready-sentinel from being touched + logged on every tick.
+  bool                              standby_ready_logged_ = false;
   double                            control_entry_s_     = -1.0;
   double                            autostart_target_s_  = -1.0;
   std::uint64_t                     control_tick_        = 0;
@@ -873,9 +1539,47 @@ class X2Deploy {
   // RAMP_OUT bookkeeping: ramp_out_entry_s_ is the steady-clock time we
   // entered RAMP_OUT, and ramp_out_start_pos_ is the target_pos_mj snapshot
   // we took at that moment. The RAMP_OUT case in OnControl lerps from
-  // ramp_out_start_pos_ -> default_angles over cli_.return_seconds.
+  // ramp_out_start_pos_ -> stand_pose_target_ over cli_.return_seconds.
   double                            ramp_out_entry_s_    = -1.0;
   std::array<double, NUM_DOFS>      ramp_out_start_pos_{};
+
+  // End-of-run handoff target (MC's STAND_DEFAULT pose). Initialised in
+  // the constructor: defaults to default_angles + deploy-mode kp/kd, and
+  // overwritten with the captured YAML values when --stand-default-pose
+  // is provided. Used by RAMP_OUT (lerp toward) and HOLD_FOR_MC (publish
+  // statically).
+  std::array<double, NUM_DOFS>      stand_pose_target_{};
+  std::array<double, NUM_DOFS>      stand_pose_stiffness_{};
+  std::array<double, NUM_DOFS>      stand_pose_damping_{};
+
+  // HOLD_FOR_MC bookkeeping. hold_for_mc_entry_s_ is the steady-clock
+  // time we entered the state. mc_takeover_detected_ is flipped by the
+  // detection subscribers below the *moment* an external publisher (MC)
+  // shows up on /aima/hal/joint/{leg,waist}/command -- we then exit
+  // cleanly on the next OnControl tick. mc_takeover_topic_ records which
+  // topic saw the first non-self publish, purely for the log line.
+  // hold_for_mc_entry_steady_ pairs with mc_takeover_steady_ts_ to
+  // produce the ms-precision delta in the takeover log line, independent
+  // of the ROS-clock rounding in hold_for_mc_entry_s_.
+  double                            hold_for_mc_entry_s_ = -1.0;
+  std::chrono::steady_clock::time_point hold_for_mc_entry_steady_{};
+  std::atomic<bool>                 mc_takeover_detected_{false};
+  // True after we've logged the "first MC publish observed" line once,
+  // so we don't spam the log on every tick once MC is back on the bus.
+  bool                              mc_takeover_logged_  = false;
+  std::string                       mc_takeover_topic_;
+  // ns-precision timestamp captured INSIDE the DDS callback (before any
+  // locks), so the trace shows the actual moment MC took the bus rather
+  // than the next OnControl tick (which can lag up to ~20 ms at 50 Hz).
+  std::chrono::steady_clock::time_point mc_takeover_steady_ts_{};
+  std::mutex                        mc_takeover_topic_mutex_;
+  // Subscribers carry SubscriptionOptions::ignore_local_publications=true
+  // so OUR command writer's traffic does not trip the detector. Kept as
+  // members so they outlive the constructor.
+  rclcpp::Subscription<aimdk_msgs::msg::JointCommandArray>::SharedPtr
+      mc_takeover_leg_sub_;
+  rclcpp::Subscription<aimdk_msgs::msg::JointCommandArray>::SharedPtr
+      mc_takeover_waist_sub_;
 
   // Output-side target LPF state. target_lpf_alpha_ is computed once in
   // Run() from cli_.target_lpf_hz at the OnControl rate (50 Hz). When alpha
